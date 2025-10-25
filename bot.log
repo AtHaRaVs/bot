@@ -1,0 +1,38 @@
+nohup: ignoring input
+/home/atharav/trading/trading/bot.py:855: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  start_time = datetime.utcnow()
+2025-10-23 23:30:39,811 [INFO] ======================================================================
+2025-10-23 23:30:39,813 [INFO] 🚀 CoinDCX Scalping Bot
+2025-10-23 23:30:39,813 [INFO] Capital: ₹350.0 | Margin: ₹300.0 | Leverage: 3x
+2025-10-23 23:30:39,813 [INFO] Strategy: TP=0.8% | SL=0.4% | R:R = 1:2.0
+2025-10-23 23:30:39,813 [INFO] Protection: 120s minimum hold | Emergency SL: 2.0%
+2025-10-23 23:30:39,813 [INFO] Telegram: ✅ Enabled
+2025-10-23 23:30:39,814 [INFO] ======================================================================
+2025-10-23 23:30:41,652 [INFO] ✓ Retrieved 1073 markets
+2025-10-23 23:30:41,655 [INFO] ✅ Selected: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
+2025-10-23 23:30:41,657 [INFO] 
+📊 Initializing...
+/home/atharav/trading/trading/bot.py:845: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  states[sym].last_update = datetime.utcnow()
+2025-10-23 23:30:41,854 [INFO] ✓ I-TRX_INR    @ ₹ 29.5400 | Qty:    30.4672
+2025-10-23 23:30:42,019 [INFO] ✓ I-ADA_INR    @ ₹ 60.9840 | Qty:    14.7580
+2025-10-23 23:30:42,220 [INFO] ✓ I-ALGO_INR   @ ₹ 17.1600 | Qty:    52.4476
+2025-10-23 23:30:42,385 [INFO] ✓ I-XRP_INR    @ ₹225.9800 | Qty:     3.9827
+2025-10-23 23:30:42,387 [INFO] 
+✓ Scalping bot running | Press Ctrl+C to stop
+
+2025-10-23 23:30:42,388 [INFO] ✓ Health server starting on port 8080
+/home/atharav/trading/trading/bot.py:805: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
+  st.last_update = datetime.utcnow()
+2025-10-23 23:31:12,654 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 23:31:12,857 [INFO] 🕯️ I-ADA_INR    ₹ 60.9840
+2025-10-23 23:31:13,046 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1600
+2025-10-23 23:31:13,220 [INFO] 🕯️ I-XRP_INR    ₹226.6199
+2025-10-23 23:32:14,267 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 23:32:14,463 [INFO] 🕯️ I-ADA_INR    ₹ 60.9840
+2025-10-23 23:32:14,645 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1600
+2025-10-23 23:32:14,825 [INFO] 🕯️ I-XRP_INR    ₹226.6200
+2025-10-23 23:33:15,905 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 23:33:16,100 [INFO] 🕯️ I-ADA_INR    ₹ 60.9840
+2025-10-23 23:33:16,303 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1600
+2025-10-23 23:33:16,494 [INFO] 🕯️ I-XRP_INR    ₹226.5899

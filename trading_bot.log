@@ -1,929 +1,955 @@
-import os
-import time
-import hmac
-import json
-import math
-import signal
-import hashlib
-import logging
-import threading
-from datetime import datetime, timedelta
-
-import requests
-
-
-# =======================
-# Config
-# =======================
-API_KEY = os.getenv("COINDCX_API_KEY", "")
-API_SECRET = os.getenv("COINDCX_API_SECRET", "")
-BASE_URL = "https://api.coindcx.com"
-FUTURES_ORDER_CREATE = "/exchange/v1/derivatives/futures/orders/create"
-
-# Paper mode toggle
-PAPER_MODE = True
-
-# TARGET COINS - Cheaper altcoins for better position sizing
-TARGET_COINS = ['MATIC', 'TRX', 'ADA', 'ALGO', 'XRP']  # Removed SOL as it's expensive
-
-# Strategy parameters
-SL_PCT = 0.0075        # 0.75% stop loss
-TP_PCT = 0.015         # 1.5% take profit
-PARTIAL_TP_PCT = 0.01  # 1.0% partial profit
-PARTIAL_TAKE = 0.50    # reduce 50% at partial TP
-TSL_ACTIVATE = 0.008   # activate trailing after +0.8%
-TSL_STEP = 0.002       # trail by 0.2% steps
-MAX_HOLD_SEC = 60 * 60 # 60 minutes
-
-# Indicators
-RSI_LEN = 14
-EMA_FAST = 20
-EMA_SLOW = 50
-VOL_MA = 20
-BREAKOUT_LOOKBACK = 15
-RSI_BUY_MAX = 65.0
-RSI_SELL_MIN = 35.0
-
-# Risk & leverage
-LEVERAGE = 3
-PER_TRADE_MARGIN_INR = 300.0
-
-# Fees
-TAKER_FEE = 0.001
-MAKER_FEE = 0.001
-
-# Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("trading_bot.log"),
-        logging.StreamHandler()
-    ]
-)
-
-
-# =======================
-# Discover Available Markets
-# =======================
-def get_available_markets():
-    """Query CoinDCX to get available trading pairs"""
-    try:
-        url = f"{BASE_URL}/exchange/v1/markets_details"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            markets = response.json()
-            logging.info(f"✓ Retrieved {len(markets)} markets from CoinDCX")
-            return markets
-        else:
-            logging.error(f"✗ Failed to fetch markets: {response.status_code}")
-            return []
-    except Exception as e:
-        logging.error(f"✗ Error fetching markets: {e}")
-        return []
-
-
-def select_tradable_symbols():
-    """Select specific target coins for trading"""
-    markets = get_available_markets()
-    
-    if not markets:
-        logging.warning("⚠️ Could not fetch markets, using defaults")
-        return [f"I-{coin}_INR" for coin in TARGET_COINS]
-    
-    # Find active INR spot markets for target coins
-    active_inr = [
-        m['pair'] for m in markets 
-        if 'INR' in m.get('pair', '') 
-        and m.get('status') == 'active'
-        and m['pair'].startswith('I-')
-    ]
-    
-    # Match our target coins
-    selected = []
-    for coin in TARGET_COINS:
-        pair = f"I-{coin}_INR"
-        if pair in active_inr:
-            selected.append(pair)
-            logging.info(f"✓ Found {pair}")
-        else:
-            logging.warning(f"⚠️ {pair} not found or inactive")
-    
-    if not selected:
-        logging.error("✗ None of the target coins are available!")
-        return []
-    
-    logging.info(f"\n✅ Selected {len(selected)} symbols: {', '.join(selected)}")
-    return selected
-
-
-# =======================
-# Utils & Indicators
-# =======================
-def hmac_signature(secret: str, body: dict) -> str:
-    payload = json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return sig
-
-
-def ema(prev_ema, price, length):
-    k = 2 / (length + 1)
-    return price * k + prev_ema * (1 - k)
-
-
-def rsi(prices, length=14):
-    if len(prices) < length + 1:
-        return None
-    gains, losses = 0.0, 0.0
-    for i in range(-length, 0):
-        ch = prices[i] - prices[i-1]
-        if ch > 0:
-            gains += ch
-        else:
-            losses -= ch
-    if losses == 0:
-        return 100.0
-    rs = (gains / length) / (losses / length)
-    return 100.0 - (100.0 / (1.0 + rs))
-
-
-# =======================
-# Ticker Data
-# =======================
-def fetch_all_tickers():
-    """Fetch all tickers from CoinDCX"""
-    try:
-        url = f"{BASE_URL}/exchange/ticker"
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            tickers = response.json()
-            ticker_dict = {}
-            for ticker in tickers:
-                market = ticker.get('market')
-                if market:
-                    ticker_dict[market] = {
-                        'price': float(ticker.get('last_price', 0)),
-                        'volume': float(ticker.get('volume', 0)),
-                        'high': float(ticker.get('high', 0)),
-                        'low': float(ticker.get('low', 0)),
-                        'bid': float(ticker.get('bid', 0)),
-                        'ask': float(ticker.get('ask', 0)),
-                        'change_24h': float(ticker.get('change_24_hour', 0)),
-                    }
-            return ticker_dict
-        return {}
-    except Exception as e:
-        logging.error(f"✗ Error fetching tickers: {e}")
-        return {}
-
-
-def convert_symbol_to_ticker_format(symbol):
-    """Convert I-BTC_INR to BTCINR format"""
-    return symbol.replace('I-', '').replace('_', '')
-
-
-def fetch_ticker_data(symbol):
-    """Fetch ticker data for a specific symbol"""
-    try:
-        all_tickers = fetch_all_tickers()
-        ticker_format = convert_symbol_to_ticker_format(symbol)
-        
-        if ticker_format in all_tickers:
-            return all_tickers[ticker_format]
-        
-        logging.warning(f"⚠️ No ticker data for {symbol} (looking for {ticker_format})")
-        return None
-    except Exception as e:
-        logging.error(f"✗ Error fetching ticker for {symbol}: {e}")
-        return None
-
-
-def create_candle_from_ticker(symbol, ticker_data):
-    """Create a synthetic 1-minute candle from ticker data"""
-    if not ticker_data or ticker_data['price'] == 0:
-        return None
-    
-    price = ticker_data['price']
-    return {
-        "t": int(time.time() * 1000),
-        "o": price,
-        "h": ticker_data.get('high', price),
-        "l": ticker_data.get('low', price),
-        "c": price,
-        "v": ticker_data.get('volume', 0),
-    }
-
-
-# =======================
-# Paper Broker
-# =======================
-class Position:
-    def __init__(self, symbol, side, qty, entry_price):
-        self.symbol = symbol
-        self.side = side
-        self.qty = qty
-        self.entry_price = entry_price
-        self.open_time = datetime.utcnow()
-        self.trailing_stop_price = None
-        self.max_favorable_price = entry_price
-        self.partial_taken = False
-
-    def uPnL_pct(self, last_price):
-        if self.side == "buy":
-            return (last_price / self.entry_price) - 1.0
-        else:
-            return (self.entry_price / last_price) - 1.0
-    
-    def uPnL_inr(self, last_price):
-        if self.side == "buy":
-            return (last_price - self.entry_price) * self.qty
-        else:
-            return (self.entry_price - last_price) * self.qty
-
-
-class PaperBroker:
-    def __init__(self, start_cash_inr=10000.0):
-        self.cash = start_cash_inr
-        self.equity = start_cash_inr
-        self.positions = {}
-        self.trades = []
-        self.start_cash = start_cash_inr
-
-    def _fee_cost(self, notional, taker=True):
-        fee = TAKER_FEE if taker else MAKER_FEE
-        return notional * fee
-
-    def place_market(self, symbol, side, qty, price):
-        if qty <= 0:
-            return False, "qty<=0"
-        if symbol in self.positions:
-            return False, "Position already open"
-        notional = qty * price
-        fee = self._fee_cost(notional, taker=True)
-        self.cash -= fee
-        self.positions[symbol] = Position(symbol, "buy" if side == "buy" else "sell", qty, price)
-        self.trades.append({
-            "ts": datetime.utcnow(),
-            "symbol": symbol,
-            "action": side,
-            "qty": qty,
-            "price": price,
-            "fee": fee,
-            "notional": notional
-        })
-        logging.info(f"📈 OPENED {side.upper()} {symbol} qty={qty:.4f} @ ₹{price:.4f} (Notional: ₹{notional:.2f})")
-        return True, {"status": "filled", "avg_price": price}
-
-    def close_market(self, symbol, price, qty=None):
-        if symbol not in self.positions:
-            return False, "No position"
-        pos = self.positions[symbol]
-        q = pos.qty if qty is None else min(qty, pos.qty)
-        if q <= 0:
-            return False, "qty<=0"
-        notional = q * price
-        fee = self._fee_cost(notional, taker=True)
-        if pos.side == "buy":
-            pnl = (price - pos.entry_price) * q
-        else:
-            pnl = (pos.entry_price - price) * q
-        self.cash += pnl
-        self.cash -= fee
-        
-        hold_time = (datetime.utcnow() - pos.open_time).seconds
-        
-        self.trades.append({
-            "ts": datetime.utcnow(),
-            "symbol": symbol,
-            "action": "close",
-            "qty": q,
-            "price": price,
-            "fee": fee,
-            "pnl": pnl,
-            "notional": notional,
-            "hold_time_sec": hold_time
-        })
-        logging.info(f"📉 CLOSED {symbol} qty={q:.4f} @ ₹{price:.4f} | PnL: ₹{pnl:+.2f} | Hold: {hold_time//60}m")
-        pos.qty -= q
-        if pos.qty <= 1e-12:
-            del self.positions[symbol]
-        return True, {"status": "closed", "pnl": pnl}
-
-    def update_equity(self, marks):
-        upnl = 0.0
-        for sym, pos in list(self.positions.items()):
-            lp = marks.get(sym)
-            if lp is None:
-                continue
-            if pos.side == "buy":
-                upnl += (lp - pos.entry_price) * pos.qty
-            else:
-                upnl += (pos.entry_price - lp) * pos.qty
-        self.equity = self.cash + upnl
-
-
-# =======================
-# Symbol State & Strategy
-# =======================
-class SymbolState:
-    def __init__(self, symbol, broker):
-        self.symbol = symbol
-        self.candles = []
-        self.closes = []
-        self.volumes = []
-        self.ema_fast = None
-        self.ema_slow = None
-        self.position = None
-        self.broker = broker
-        self.last_update = None
-
-    def last_close(self):
-        return float(self.candles[-1]["c"]) if self.candles else None
-
-
-def update_indicators(state: SymbolState):
-    if not state.candles:
-        return
-    closes = [float(c["c"]) for c in state.candles]
-    vols = [float(c.get("v", 0)) for c in state.candles]
-    state.closes = closes
-    state.volumes = vols
-    
-    if state.ema_fast is None:
-        if len(closes) >= EMA_SLOW:
-            state.ema_fast = sum(closes[-EMA_FAST:]) / EMA_FAST
-            state.ema_slow = sum(closes[-EMA_SLOW:]) / EMA_SLOW
-    else:
-        state.ema_fast = ema(state.ema_fast, closes[-1], EMA_FAST)
-        state.ema_slow = ema(state.ema_slow, closes[-1], EMA_SLOW)
-
-
-def compute_breakout_levels(state: SymbolState):
-    if len(state.candles) < BREAKOUT_LOOKBACK + 1:
-        return None, None
-    highs = [float(c["h"]) for c in state.candles[-(BREAKOUT_LOOKBACK+1):-1]]
-    lows = [float(c["l"]) for c in state.candles[-(BREAKOUT_LOOKBACK+1):-1]]
-    return max(highs), min(lows)
-
-
-def volume_ok(state: SymbolState):
-    if len(state.candles) < VOL_MA + 1:
-        return True
-    vols = [float(c.get("v", 0)) for c in state.candles]
-    if all(v == 0 for v in vols):
-        return True  # Skip volume filter if no data
-    last_v = vols[-1]
-    ma = sum(vols[-VOL_MA:]) / VOL_MA
-    return last_v > ma if ma > 0 else True
-
-
-def eligible_momentum(state: SymbolState, long=True):
-    if state.ema_fast is None or state.ema_slow is None or len(state.closes) < RSI_LEN + 1:
-        return False
-    r = rsi(state.closes, RSI_LEN)
-    if r is None:
-        return False
-    if long:
-        return (r < RSI_BUY_MAX) and (state.ema_fast > state.ema_slow) and volume_ok(state)
-    else:
-        return (r > RSI_SELL_MIN) and (state.ema_fast < state.ema_slow) and volume_ok(state)
-
-
-def calc_qty_from_inr(price_in_inr, per_trade_margin_inr, leverage):
-    """Calculate quantity based on margin and leverage"""
-    notional = per_trade_margin_inr * leverage
-    qty = max(0.0, notional / max(1e-9, price_in_inr))
-    # Round to appropriate decimals based on price
-    if price_in_inr < 1:
-        return round(qty, 2)
-    elif price_in_inr < 10:
-        return round(qty, 4)
-    elif price_in_inr < 100:
-        return round(qty, 6)
-    else:
-        return round(qty, 8)
-
-
-def maybe_enter(state: SymbolState):
-    if len(state.candles) < BREAKOUT_LOOKBACK + 2 or state.position is not None:
-        return
-    last = state.candles[-1]
-    close = float(last["c"])
-    hi, lo = compute_breakout_levels(state)
-    if hi is None:
-        return
-    
-    qty = calc_qty_from_inr(close, PER_TRADE_MARGIN_INR, LEVERAGE)
-    
-    if close > hi and eligible_momentum(state, long=True):
-        ok, resp = state.broker.place_market(state.symbol, "buy", qty, close)
-        if ok:
-            state.position = Position(state.symbol, "buy", qty, close)
-    elif close < lo and eligible_momentum(state, long=False):
-        ok, resp = state.broker.place_market(state.symbol, "sell", qty, close)
-        if ok:
-            state.position = Position(state.symbol, "sell", qty, close)
-
-
-def manage_exit(state: SymbolState):
-    if state.position is None or len(state.candles) == 0:
-        return
-    last = float(state.candles[-1]["c"])
-    pos = state.position
-    pnl = pos.uPnL_pct(last)
-
-    # Partial profit
-    if pnl >= PARTIAL_TP_PCT and not pos.partial_taken:
-        reduce_qty = round(pos.qty * PARTIAL_TAKE, 6)
-        ok, resp = state.broker.close_market(pos.symbol, last, qty=reduce_qty)
-        if ok:
-            pos.qty -= reduce_qty
-            pos.partial_taken = True
-            if pos.qty <= 1e-12:
-                state.position = None
-            return
-
-    # Hard TP/SL
-    if pnl >= TP_PCT or pnl <= -SL_PCT:
-        ok, resp = state.broker.close_market(pos.symbol, last)
-        if ok:
-            state.position = None
-        return
-
-    # Time exit
-    if datetime.utcnow() - pos.open_time >= timedelta(seconds=MAX_HOLD_SEC):
-        ok, resp = state.broker.close_market(pos.symbol, last)
-        if ok:
-            state.position = None
-        return
-
-    # Trailing stop
-    if pnl >= TSL_ACTIVATE:
-        if pos.side == "buy":
-            pos.max_favorable_price = max(pos.max_favorable_price, last)
-            new_trailing = pos.max_favorable_price * (1.0 - TSL_STEP)
-            if pos.trailing_stop_price is None or new_trailing > pos.trailing_stop_price:
-                pos.trailing_stop_price = new_trailing
-            if last <= pos.trailing_stop_price:
-                ok, resp = state.broker.close_market(pos.symbol, last)
-                if ok:
-                    state.position = None
-
-
-# =======================
-# Main Bot Logic
-# =======================
-paper_broker = PaperBroker(start_cash_inr=10000.0)
-states = {}
-stop_flag = False
-SYMBOLS = []
-start_time = None
-
-
-def ticker_polling_thread():
-    """Poll ticker API for price updates"""
-    while not stop_flag:
-        try:
-            time.sleep(60)  # Every minute
-            
-            for sym in SYMBOLS:
-                if sym not in states:
-                    continue
-                
-                st = states[sym]
-                
-                ticker = fetch_ticker_data(sym)
-                if ticker and ticker['price'] > 0:
-                    candle = create_candle_from_ticker(sym, ticker)
-                    if candle:
-                        current_minute = candle['t'] // 60000
-                        last_minute = st.candles[-1]['t'] // 60000 if st.candles else 0
-                        
-                        if current_minute != last_minute:
-                            st.candles.append(candle)
-                            st.last_update = datetime.utcnow()
-                            
-                            if len(st.candles) > 500:
-                                st.candles = st.candles[-500:]
-                            
-                            # Show 24h change if available
-                            change = ticker.get('change_24h', 0)
-                            change_str = f"({change:+.2f}%)" if change != 0 else ""
-                            
-                            logging.info(f"🕯️ {sym:12} ₹{candle['c']:8.4f} {change_str} | H: ₹{candle['h']:8.4f} | L: ₹{candle['l']:8.4f}")
-                            
-                            update_indicators(st)
-                            maybe_enter(st)
-                            manage_exit(st)
-                else:
-                    logging.warning(f"⚠️ No ticker data for {sym}")
-                
-            marks = {s: float(states[s].candles[-1]["c"]) for s in states if states[s].candles}
-            if marks:
-                paper_broker.update_equity(marks)
-                
-                pos_info = []
-                for sym, pos in paper_broker.positions.items():
-                    if sym in marks:
-                        upnl_pct = pos.uPnL_pct(marks[sym]) * 100
-                        upnl_inr = pos.uPnL_inr(marks[sym])
-                        pos_info.append(f"{sym} {pos.side} ₹{upnl_inr:+.2f} ({upnl_pct:+.2f}%)")
-                
-                pos_str = " | ".join(pos_info) if pos_info else "No open positions"
-                logging.info(f"💰 Equity: ₹{paper_broker.equity:.2f} | Cash: ₹{paper_broker.cash:.2f} | {pos_str}\n")
-                
-        except Exception as e:
-            logging.exception(f"✗ Ticker polling error: {e}")
-
-
-def initialize_with_ticker():
-    """Initialize candles using ticker data"""
-    logging.info("\n📊 Initializing with ticker data...")
-    
-    for sym in SYMBOLS:
-        ticker = fetch_ticker_data(sym)
-        if ticker and ticker['price'] > 0:
-            states[sym].candles = []
-            base_price = ticker['price']
-            
-            # Generate 50 synthetic candles
-            for i in range(50):
-                fake_candle = {
-                    "t": int((time.time() - (50-i)*60) * 1000),
-                    "o": base_price * (1 + (i-25)*0.0005),
-                    "h": base_price * (1 + (i-25)*0.0005 + 0.001),
-                    "l": base_price * (1 + (i-25)*0.0005 - 0.001),
-                    "c": base_price * (1 + (i-24)*0.0005),
-                    "v": 100000,
-                }
-                states[sym].candles.append(fake_candle)
-            
-            states[sym].last_update = datetime.utcnow()
-            update_indicators(states[sym])
-            
-            # Calculate how many units we can buy
-            qty = calc_qty_from_inr(base_price, PER_TRADE_MARGIN_INR, LEVERAGE)
-            notional = qty * base_price
-            
-            logging.info(f"✓ {sym:12} @ ₹{base_price:8.4f} | Qty: {qty:10.4f} units | Notional: ₹{notional:.2f}")
-        else:
-            logging.error(f"✗ Failed to initialize {sym}")
-
-
-def generate_report():
-    """Generate final trading report"""
-    logging.info("\n" + "=" * 70)
-    logging.info("📊 FINAL TRADING REPORT")
-    logging.info("=" * 70)
-    
-    if start_time:
-        runtime = datetime.utcnow() - start_time
-        hours = runtime.seconds // 3600
-        minutes = (runtime.seconds % 3600) // 60
-        logging.info(f"⏱️  Runtime: {hours}h {minutes}m")
-    
-    logging.info(f"\n💰 Account Summary:")
-    logging.info(f"   Starting Capital: ₹{paper_broker.start_cash:.2f}")
-    logging.info(f"   Final Equity:     ₹{paper_broker.equity:.2f}")
-    logging.info(f"   Final Cash:       ₹{paper_broker.cash:.2f}")
-    
-    total_pnl = paper_broker.equity - paper_broker.start_cash
-    pnl_pct = (total_pnl / paper_broker.start_cash) * 100
-    logging.info(f"   Total P&L:        ₹{total_pnl:+.2f} ({pnl_pct:+.2f}%)")
-    
-    logging.info(f"\n📈 Trading Statistics:")
-    logging.info(f"   Total Trades:     {len(paper_broker.trades)}")
-    
-    if paper_broker.trades:
-        closed_trades = [t for t in paper_broker.trades if 'pnl' in t]
-        if closed_trades:
-            winning_trades = [t for t in closed_trades if t['pnl'] > 0]
-            losing_trades = [t for t in closed_trades if t['pnl'] < 0]
-            
-            logging.info(f"   Winning Trades:   {len(winning_trades)}")
-            logging.info(f"   Losing Trades:    {len(losing_trades)}")
-            
-            if closed_trades:
-                win_rate = (len(winning_trades) / len(closed_trades)) * 100
-                logging.info(f"   Win Rate:         {win_rate:.1f}%")
-            
-            if winning_trades:
-                avg_win = sum(t['pnl'] for t in winning_trades) / len(winning_trades)
-                max_win = max(t['pnl'] for t in winning_trades)
-                logging.info(f"   Avg Win:          ₹{avg_win:.2f}")
-                logging.info(f"   Max Win:          ₹{max_win:.2f}")
-            
-            if losing_trades:
-                avg_loss = sum(t['pnl'] for t in losing_trades) / len(losing_trades)
-                max_loss = min(t['pnl'] for t in losing_trades)
-                logging.info(f"   Avg Loss:         ₹{avg_loss:.2f}")
-                logging.info(f"   Max Loss:         ₹{max_loss:.2f}")
-            
-            total_fees = sum(t.get('fee', 0) for t in paper_broker.trades)
-            logging.info(f"   Total Fees Paid:  ₹{total_fees:.2f}")
-            
-            if closed_trades:
-                avg_hold = sum(t.get('hold_time_sec', 0) for t in closed_trades) / len(closed_trades)
-                logging.info(f"   Avg Hold Time:    {int(avg_hold//60)}m {int(avg_hold%60)}s")
-    
-    if paper_broker.positions:
-        logging.info(f"\n⚠️  Open Positions:")
-        marks = {s: float(states[s].candles[-1]["c"]) for s in states if states[s].candles}
-        for sym, pos in paper_broker.positions.items():
-            if sym in marks:
-                upnl_pct = pos.uPnL_pct(marks[sym]) * 100
-                upnl_inr = pos.uPnL_inr(marks[sym])
-                logging.info(f"   {sym:12} {pos.side.upper():4} {pos.qty:10.4f} @ ₹{pos.entry_price:8.4f} | Current: ₹{marks[sym]:8.4f} | uPnL: ₹{upnl_inr:+.2f} ({upnl_pct:+.2f}%)")
-    
-    if paper_broker.trades:
-        logging.info(f"\n📋 Recent Trades (Last 10):")
-        for t in paper_broker.trades[-10:]:
-            pnl_str = f"| P&L: ₹{t.get('pnl', 0):+7.2f}" if 'pnl' in t else " " * 18
-            logging.info(f"   {t['ts'].strftime('%Y-%m-%d %H:%M:%S')} | {t['symbol']:12} {t['action']:5} @ ₹{t.get('price', 0):8.4f} {pnl_str}")
-    
-    logging.info("=" * 70)
-    logging.info("✅ Report saved to trading_bot.log")
-    logging.info("=" * 70 + "\n")
-
-
-def main():
-    global stop_flag, SYMBOLS, states, start_time
-    
-    start_time = datetime.utcnow()
-    
-    logging.info("=" * 70)
-    logging.info("🚀 CoinDCX Intraday Trading Bot")
-    logging.info(f"Mode: {'💰 PAPER TRADING' if PAPER_MODE else '🔴 LIVE TRADING'}")
-    logging.info(f"Target Coins: {', '.join(TARGET_COINS)}")
-    logging.info(f"Margin/Trade: ₹{PER_TRADE_MARGIN_INR} | Leverage: {LEVERAGE}x | Max Position: ₹{PER_TRADE_MARGIN_INR * LEVERAGE}")
-    logging.info("=" * 70)
-    
-    SYMBOLS = select_tradable_symbols()
-    
-    if not SYMBOLS:
-        logging.error("✗ No trading symbols available. Exiting.")
-        return
-    
-    states = {sym: SymbolState(sym, paper_broker) for sym in SYMBOLS}
-    
-    initialize_with_ticker()
-    
-    polling_thread = threading.Thread(target=ticker_polling_thread, daemon=True)
-    polling_thread.start()
-    logging.info("\n✓ Ticker polling thread started")
-    logging.info("✓ Press Ctrl+C to stop and generate report\n")
-    
-    try:
-        while not stop_flag:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logging.info("\n⚠️  Shutting down gracefully...")
-        stop_flag = True
-        time.sleep(1)
-        generate_report()
-
-
-if __name__ == "__main__":
-    def signal_handler(sig, frame):
-        global stop_flag
-        logging.info("\n⚠️  Interrupt signal received...")
-        stop_flag = True
-        time.sleep(1)
-        generate_report()
-        import sys
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    main()
-2025-10-23 14:26:47,405 [INFO] 
-⚠️  Interrupt signal received...
-2025-10-23 14:26:48,406 [INFO] 
-======================================================================
-2025-10-23 14:26:48,406 [INFO] 📊 FINAL TRADING REPORT
-2025-10-23 14:26:48,406 [INFO] ======================================================================
-2025-10-23 14:26:48,407 [INFO] ⏱️  Runtime: 0h 0m
-2025-10-23 14:26:48,407 [INFO] 
-💰 Account Summary:
-2025-10-23 14:26:48,407 [INFO]    Starting Capital: ₹10000.00
-2025-10-23 14:26:48,408 [INFO]    Final Equity:     ₹10000.00
-2025-10-23 14:26:48,408 [INFO]    Final Cash:       ₹10000.00
-2025-10-23 14:26:48,408 [INFO]    Total P&L:        ₹+0.00 (+0.00%)
-2025-10-23 14:26:48,408 [INFO] 
-📈 Trading Statistics:
-2025-10-23 14:26:48,409 [INFO]    Total Trades:     0
-2025-10-23 14:26:48,409 [INFO] ======================================================================
-2025-10-23 14:26:48,409 [INFO] ✅ Report saved to trading_bot.log
-2025-10-23 14:26:48,409 [INFO] ======================================================================
-
-2025-10-23 14:26:55,104 [INFO] ============================================================
-2025-10-23 14:26:55,104 [INFO] 🚀 CoinDCX Trading Bot Started
-2025-10-23 14:26:55,105 [INFO] Mode: PAPER TRADING
-2025-10-23 14:26:55,105 [INFO] ============================================================
-2025-10-23 14:26:55,471 [INFO] ✓ Retrieved 1073 markets from CoinDCX
-2025-10-23 14:26:55,472 [INFO] ✓ Found 437 active INR spot markets
-2025-10-23 14:26:55,477 [INFO] 
-✅ Selected symbols: I-BTC_INR, I-ETH_INR, I-SOL_INR
-2025-10-23 14:26:55,478 [INFO] 📊 Initializing with ticker data...
-2025-10-23 14:26:55,712 [INFO] ✓ Initialized I-BTC_INR @ ₹10192269.00 with 50 candles
-2025-10-23 14:26:55,903 [INFO] ✓ Initialized I-ETH_INR @ ₹361185.00 with 50 candles
-2025-10-23 14:26:56,108 [INFO] ✓ Initialized I-SOL_INR @ ₹17579.43 with 50 candles
-2025-10-23 14:26:56,110 [INFO] ✓ Ticker polling thread started
-2025-10-23 14:26:56,110 [INFO] ✓ Press Ctrl+C to stop and generate report
-
-2025-10-23 14:27:34,702 [INFO] 
-⚠️  Interrupt signal received...
-2025-10-23 14:27:35,703 [INFO] 
-======================================================================
-2025-10-23 14:27:35,703 [INFO] 📊 FINAL TRADING REPORT
-2025-10-23 14:27:35,703 [INFO] ======================================================================
-2025-10-23 14:27:35,703 [INFO] ⏱️  Runtime: 0h 0m
-2025-10-23 14:27:35,704 [INFO] 
-💰 Account Summary:
-2025-10-23 14:27:35,704 [INFO]    Starting Capital: ₹10000.00
-2025-10-23 14:27:35,704 [INFO]    Final Equity:     ₹10000.00
-2025-10-23 14:27:35,704 [INFO]    Final Cash:       ₹10000.00
-2025-10-23 14:27:35,704 [INFO]    Total P&L:        ₹+0.00 (+0.00%)
-2025-10-23 14:27:35,705 [INFO] 
-📈 Trading Statistics:
-2025-10-23 14:27:35,705 [INFO]    Total Trades:     0
-2025-10-23 14:27:35,705 [INFO] ======================================================================
-2025-10-23 14:27:35,705 [INFO] ✅ Report saved to trading_bot.log
-2025-10-23 14:27:35,705 [INFO] ======================================================================
-
-2025-10-23 14:27:40,418 [INFO] ======================================================================
-2025-10-23 14:27:40,418 [INFO] 🚀 CoinDCX Intraday Trading Bot
-2025-10-23 14:27:40,418 [INFO] Mode: 💰 PAPER TRADING
-2025-10-23 14:27:40,418 [INFO] Target Coins: MATIC, TRX, ADA, ALGO, XRP
-2025-10-23 14:27:40,418 [INFO] Margin/Trade: ₹300.0 | Leverage: 3x | Max Position: ₹900.0
-2025-10-23 14:27:40,418 [INFO] ======================================================================
-2025-10-23 14:27:40,691 [INFO] ✓ Retrieved 1073 markets from CoinDCX
-2025-10-23 14:27:40,693 [WARNING] ⚠️ I-MATIC_INR not found or inactive
-2025-10-23 14:27:40,693 [INFO] ✓ Found I-TRX_INR
-2025-10-23 14:27:40,693 [INFO] ✓ Found I-ADA_INR
-2025-10-23 14:27:40,693 [INFO] ✓ Found I-ALGO_INR
-2025-10-23 14:27:40,693 [INFO] ✓ Found I-XRP_INR
-2025-10-23 14:27:40,693 [INFO] 
+2025-10-23 15:03:51,716 [INFO] ======================================================================
+2025-10-23 15:03:51,716 [INFO] 🚀 CoinDCX Intraday Trading Bot
+2025-10-23 15:03:51,717 [INFO] Mode: 💰 PAPER TRADING
+2025-10-23 15:03:51,717 [INFO] Starting Capital: ₹350.0
+2025-10-23 15:03:51,717 [INFO] Target Coins: MATIC, TRX, ADA, ALGO, XRP
+2025-10-23 15:03:51,717 [INFO] Margin/Trade: ₹300.0 | Leverage: 3x | Max Position: ₹900.0
+2025-10-23 15:03:51,717 [INFO] Max Concurrent Positions: 1
+2025-10-23 15:03:51,717 [INFO] ======================================================================
+2025-10-23 15:03:52,013 [INFO] ✓ Retrieved 1073 markets from CoinDCX
+2025-10-23 15:03:52,019 [WARNING] ⚠️ I-MATIC_INR not found or inactive
+2025-10-23 15:03:52,019 [INFO] ✓ Found I-TRX_INR
+2025-10-23 15:03:52,019 [INFO] ✓ Found I-ADA_INR
+2025-10-23 15:03:52,020 [INFO] ✓ Found I-ALGO_INR
+2025-10-23 15:03:52,020 [INFO] ✓ Found I-XRP_INR
+2025-10-23 15:03:52,020 [INFO] 
 ✅ Selected 4 symbols: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
-2025-10-23 14:27:40,694 [INFO] 
+2025-10-23 15:03:52,023 [INFO] 
 📊 Initializing with ticker data...
-2025-10-23 14:27:40,845 [INFO] ✓ I-TRX_INR    @ ₹ 30.1500 | Qty:    29.8507 units | Notional: ₹900.00
-2025-10-23 14:27:41,021 [INFO] ✓ I-ADA_INR    @ ₹ 59.8770 | Qty:    15.0308 units | Notional: ₹900.00
-2025-10-23 14:27:41,183 [INFO] ✓ I-ALGO_INR   @ ₹ 17.1120 | Qty:    52.5947 units | Notional: ₹900.00
-2025-10-23 14:27:41,402 [INFO] ✓ I-XRP_INR    @ ₹225.7300 | Qty:     3.9871 units | Notional: ₹900.00
-2025-10-23 14:27:41,403 [INFO] 
+2025-10-23 15:03:52,226 [INFO] ✓ I-TRX_INR    @ ₹ 30.0610 | Qty:    29.9391 units | Notional: ₹900.00
+2025-10-23 15:03:52,363 [INFO] ✓ I-ADA_INR    @ ₹ 59.9160 | Qty:    15.0210 units | Notional: ₹900.00
+2025-10-23 15:03:52,474 [INFO] ✓ I-ALGO_INR   @ ₹ 17.2370 | Qty:    52.2133 units | Notional: ₹900.00
+2025-10-23 15:03:52,634 [INFO] ✓ I-XRP_INR    @ ₹225.5932 | Qty:     3.9895 units | Notional: ₹900.00
+2025-10-23 15:03:52,634 [INFO] 
 ✓ Ticker polling thread started
-2025-10-23 14:27:41,403 [INFO] ✓ Press Ctrl+C to stop and generate report
+2025-10-23 15:03:52,634 [INFO] ✓ Press Ctrl+C to stop and generate report
 
-2025-10-23 14:28:05,140 [INFO] 
+2025-10-23 15:04:53,312 [INFO] 🕯️ I-TRX_INR    ₹ 29.8600 (-0.62%) | H: ₹ 30.3400 | L: ₹ 29.5460
+2025-10-23 15:04:53,496 [INFO] 🕯️ I-ADA_INR    ₹ 59.9410 (+1.55%) | H: ₹ 60.2370 | L: ₹ 57.1360
+2025-10-23 15:04:53,715 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2370 (+2.74%) | H: ₹ 20.0000 | L: ₹ 16.6600
+2025-10-23 15:04:53,929 [INFO] 🕯️ I-XRP_INR    ₹225.5976 (+0.21%) | H: ₹226.4628 | L: ₹219.1488
+2025-10-23 15:04:53,929 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
+
+2025-10-23 15:05:08,384 [INFO] 
 ⚠️  Interrupt signal received...
-2025-10-23 14:28:06,141 [INFO] 
+2025-10-23 15:05:09,384 [INFO] 
 ======================================================================
-2025-10-23 14:28:06,141 [INFO] 📊 FINAL TRADING REPORT
-2025-10-23 14:28:06,142 [INFO] ======================================================================
-2025-10-23 14:28:06,142 [INFO] ⏱️  Runtime: 0h 0m
-2025-10-23 14:28:06,142 [INFO] 
+2025-10-23 15:05:09,384 [INFO] 📊 FINAL TRADING REPORT
+2025-10-23 15:05:09,384 [INFO] ======================================================================
+2025-10-23 15:05:09,384 [INFO] ⏱️  Runtime: 0h 1m
+2025-10-23 15:05:09,385 [INFO] 
 💰 Account Summary:
-2025-10-23 14:28:06,143 [INFO]    Starting Capital: ₹10000.00
-2025-10-23 14:28:06,143 [INFO]    Final Equity:     ₹10000.00
-2025-10-23 14:28:06,143 [INFO]    Final Cash:       ₹10000.00
-2025-10-23 14:28:06,143 [INFO]    Total P&L:        ₹+0.00 (+0.00%)
-2025-10-23 14:28:06,144 [INFO] 
+2025-10-23 15:05:09,385 [INFO]    Starting Capital: ₹350.00
+2025-10-23 15:05:09,385 [INFO]    Final Equity:     ₹350.00
+2025-10-23 15:05:09,385 [INFO]    Final Cash:       ₹350.00
+2025-10-23 15:05:09,385 [INFO]    Total P&L:        ₹+0.00 (+0.00%)
+2025-10-23 15:05:09,385 [INFO] 
 📈 Trading Statistics:
-2025-10-23 14:28:06,144 [INFO]    Total Trades:     0
-2025-10-23 14:28:06,144 [INFO] ======================================================================
-2025-10-23 14:28:06,144 [INFO] ✅ Report saved to trading_bot.log
-2025-10-23 14:28:06,144 [INFO] ======================================================================
+2025-10-23 15:05:09,385 [INFO]    Total Trades:     0
+2025-10-23 15:05:09,385 [INFO] ======================================================================
+2025-10-23 15:05:09,385 [INFO] ✅ Report saved to trading_bot.log
+2025-10-23 15:05:09,385 [INFO] ======================================================================
 
-2025-10-23 14:32:27,305 [INFO] ======================================================================
-2025-10-23 14:32:27,305 [INFO] 🚀 CoinDCX Intraday Trading Bot
-2025-10-23 14:32:27,306 [INFO] Mode: 💰 PAPER TRADING
-2025-10-23 14:32:27,306 [INFO] Starting Capital: ₹350.0
-2025-10-23 14:32:27,306 [INFO] Target Coins: MATIC, TRX, ADA, ALGO, XRP
-2025-10-23 14:32:27,306 [INFO] Margin/Trade: ₹300.0 | Leverage: 3x | Max Position: ₹900.0
-2025-10-23 14:32:27,306 [INFO] Max Concurrent Positions: 1
-2025-10-23 14:32:27,306 [INFO] ======================================================================
-2025-10-23 14:32:27,605 [INFO] ✓ Retrieved 1073 markets from CoinDCX
-2025-10-23 14:32:27,609 [WARNING] ⚠️ I-MATIC_INR not found or inactive
-2025-10-23 14:32:27,609 [INFO] ✓ Found I-TRX_INR
-2025-10-23 14:32:27,610 [INFO] ✓ Found I-ADA_INR
-2025-10-23 14:32:27,610 [INFO] ✓ Found I-ALGO_INR
-2025-10-23 14:32:27,610 [INFO] ✓ Found I-XRP_INR
-2025-10-23 14:32:27,610 [INFO] 
+2025-10-23 15:05:16,781 [INFO] ======================================================================
+2025-10-23 15:05:16,781 [INFO] 🚀 CoinDCX Intraday Trading Bot
+2025-10-23 15:05:16,781 [INFO] Mode: 💰 PAPER TRADING
+2025-10-23 15:05:16,781 [INFO] Starting Capital: ₹350.0
+2025-10-23 15:05:16,781 [INFO] Target Coins: MATIC, TRX, ADA, ALGO, XRP
+2025-10-23 15:05:16,781 [INFO] Margin/Trade: ₹300.0 | Leverage: 3x | Max Position: ₹900.0
+2025-10-23 15:05:16,781 [INFO] Max Concurrent Positions: 1
+2025-10-23 15:05:16,781 [INFO] ======================================================================
+2025-10-23 15:05:17,098 [INFO] ✓ Retrieved 1073 markets from CoinDCX
+2025-10-23 15:05:17,102 [WARNING] ⚠️ I-MATIC_INR not found or inactive
+2025-10-23 15:05:17,102 [INFO] ✓ Found I-TRX_INR
+2025-10-23 15:05:17,102 [INFO] ✓ Found I-ADA_INR
+2025-10-23 15:05:17,102 [INFO] ✓ Found I-ALGO_INR
+2025-10-23 15:05:17,103 [INFO] ✓ Found I-XRP_INR
+2025-10-23 15:05:17,103 [INFO] 
 ✅ Selected 4 symbols: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
-2025-10-23 14:32:27,613 [INFO] 
+2025-10-23 15:05:17,105 [INFO] 
 📊 Initializing with ticker data...
-2025-10-23 14:32:27,778 [INFO] ✓ I-TRX_INR    @ ₹ 30.1600 | Qty:    29.8408 units | Notional: ₹900.00
-2025-10-23 14:32:27,871 [INFO] ✓ I-ADA_INR    @ ₹ 59.9430 | Qty:    15.0143 units | Notional: ₹900.00
-2025-10-23 14:32:27,994 [INFO] ✓ I-ALGO_INR   @ ₹ 17.1120 | Qty:    52.5947 units | Notional: ₹900.00
-2025-10-23 14:32:28,201 [INFO] ✓ I-XRP_INR    @ ₹225.2000 | Qty:     3.9964 units | Notional: ₹900.00
-2025-10-23 14:32:28,202 [INFO] 
+2025-10-23 15:05:17,283 [INFO] ✓ I-TRX_INR    @ ₹ 29.8600 | Qty:    30.1407 units | Notional: ₹900.00
+2025-10-23 15:05:17,410 [INFO] ✓ I-ADA_INR    @ ₹ 59.9410 | Qty:    15.0148 units | Notional: ₹900.00
+2025-10-23 15:05:17,580 [INFO] ✓ I-ALGO_INR   @ ₹ 17.2370 | Qty:    52.2133 units | Notional: ₹900.00
+2025-10-23 15:05:17,693 [INFO] ✓ I-XRP_INR    @ ₹225.4800 | Qty:     3.9915 units | Notional: ₹900.00
+2025-10-23 15:05:17,693 [INFO] 
 ✓ Ticker polling thread started
-2025-10-23 14:32:28,203 [INFO] ✓ Press Ctrl+C to stop and generate report
+2025-10-23 15:05:17,693 [INFO] ✓ Press Ctrl+C to stop and generate report
 
-2025-10-23 14:33:28,368 [INFO] 🕯️ I-TRX_INR    ₹ 30.1600 (-0.30%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:33:28,523 [INFO] 🕯️ I-ADA_INR    ₹ 59.9890 (+1.43%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:33:28,675 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:33:28,831 [INFO] 🕯️ I-XRP_INR    ₹225.2000 (+0.96%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:33:28,831 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
+2025-10-23 15:06:17,873 [INFO] 🕯️ I-TRX_INR    ₹ 29.8600 (-0.62%) | H: ₹ 30.3400 | L: ₹ 29.5460
+2025-10-23 15:06:18,034 [INFO] 🕯️ I-ADA_INR    ₹ 59.5010 (+1.06%) | H: ₹ 60.2370 | L: ₹ 57.1360
+2025-10-23 15:06:18,207 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (+2.74%) | H: ₹ 20.0000 | L: ₹ 16.6600
+2025-10-23 15:06:18,409 [INFO] 🕯️ I-XRP_INR    ₹225.4300 (+0.86%) | H: ₹226.4628 | L: ₹219.1488
+2025-10-23 15:06:18,410 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
 
-2025-10-23 14:34:28,958 [INFO] 🕯️ I-TRX_INR    ₹ 30.1600 (-0.30%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:34:29,094 [INFO] 🕯️ I-ADA_INR    ₹ 59.9890 (+0.83%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:34:29,261 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:34:29,433 [INFO] 🕯️ I-XRP_INR    ₹225.8200 (+0.63%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:34:29,434 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:35:29,551 [INFO] 🕯️ I-TRX_INR    ₹ 30.1600 (-0.30%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:35:29,700 [INFO] 🕯️ I-ADA_INR    ₹ 59.8940 (+0.67%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:35:29,868 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:35:30,040 [INFO] 🕯️ I-XRP_INR    ₹225.4800 (+0.51%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:35:30,041 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:36:30,220 [INFO] 🕯️ I-TRX_INR    ₹ 30.1490 (-0.30%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:36:30,370 [INFO] 🕯️ I-ADA_INR    ₹ 59.8940 (+1.34%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:36:30,537 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:36:30,706 [INFO] 🕯️ I-XRP_INR    ₹225.4200 (+0.81%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:36:30,706 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:37:30,955 [INFO] 🕯️ I-TRX_INR    ₹ 30.1490 (-0.17%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:37:31,139 [INFO] 🕯️ I-ADA_INR    ₹ 59.8940 (+0.82%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:37:31,296 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:37:31,433 [INFO] 🕯️ I-XRP_INR    ₹225.0000 (+0.52%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:37:31,433 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:38:31,567 [INFO] 🕯️ I-TRX_INR    ₹ 30.1380 (-0.20%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:38:31,760 [INFO] 🕯️ I-ADA_INR    ₹ 59.9280 (+1.05%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:38:31,973 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:38:32,641 [INFO] 🕯️ I-XRP_INR    ₹225.6900 (+1.03%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:38:32,641 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:39:32,763 [INFO] 🕯️ I-TRX_INR    ₹ 30.1380 (-0.20%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:39:32,933 [INFO] 🕯️ I-ADA_INR    ₹ 59.9280 (+1.04%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:39:33,035 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:39:33,162 [INFO] 🕯️ I-XRP_INR    ₹225.7600 (+0.93%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:39:33,162 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:40:33,319 [INFO] 🕯️ I-TRX_INR    ₹ 30.1380 (-0.37%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:40:33,479 [INFO] 🕯️ I-ADA_INR    ₹ 59.9380 (+1.01%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:40:33,615 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:40:33,776 [INFO] 🕯️ I-XRP_INR    ₹225.6000 (+0.88%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:40:33,777 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:41:33,989 [INFO] 🕯️ I-TRX_INR    ₹ 30.1380 (-0.37%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:41:34,204 [INFO] 🕯️ I-ADA_INR    ₹ 59.9380 (+1.03%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:41:34,364 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-1.67%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:41:34,623 [INFO] 🕯️ I-XRP_INR    ₹225.5400 (+0.92%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:41:34,623 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:42:34,842 [INFO] 🕯️ I-TRX_INR    ₹ 30.1380 (-0.37%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:42:35,000 [INFO] 🕯️ I-ADA_INR    ₹ 59.8690 (+0.94%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:42:35,166 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-0.25%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:42:35,341 [INFO] 🕯️ I-XRP_INR    ₹225.2902 (+0.91%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:42:35,341 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:43:35,525 [INFO] 🕯️ I-TRX_INR    ₹ 29.8700 (-0.55%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:43:35,691 [INFO] 🕯️ I-ADA_INR    ₹ 59.8690 (+1.10%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:43:35,864 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-0.25%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:43:36,022 [INFO] 🕯️ I-XRP_INR    ₹225.4600 (+0.49%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:43:36,022 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:44:36,236 [INFO] 🕯️ I-TRX_INR    ₹ 30.1380 (+0.35%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:44:36,410 [INFO] 🕯️ I-ADA_INR    ₹ 59.8560 (+1.50%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:44:36,641 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-0.25%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:44:36,798 [INFO] 🕯️ I-XRP_INR    ₹225.4784 (+1.08%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:44:36,799 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:45:36,908 [INFO] 🕯️ I-TRX_INR    ₹ 29.7500 (+0.35%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:45:37,026 [INFO] 🕯️ I-ADA_INR    ₹ 59.8560 (+1.10%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:45:39,361 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-0.25%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:45:39,611 [INFO] 🕯️ I-XRP_INR    ₹225.4311 (+0.51%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:45:39,612 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:46:39,817 [INFO] 🕯️ I-TRX_INR    ₹ 29.8600 (-0.62%) | H: ₹ 30.3400 | L: ₹ 29.5460
-2025-10-23 14:46:39,969 [INFO] 🕯️ I-ADA_INR    ₹ 59.8910 (+1.16%) | H: ₹ 60.2370 | L: ₹ 57.1360
-2025-10-23 14:46:40,083 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1120 (-0.25%) | H: ₹ 20.0000 | L: ₹ 16.6600
-2025-10-23 14:46:40,262 [INFO] 🕯️ I-XRP_INR    ₹225.0893 (+0.93%) | H: ₹226.4628 | L: ₹219.1488
-2025-10-23 14:46:40,262 [INFO] 💰 Equity: ₹350.00 | Cash: ₹350.00 | No open positions
-
-2025-10-23 14:47:18,710 [INFO] 
+2025-10-23 15:06:42,881 [INFO] 
 ⚠️  Interrupt signal received...
-2025-10-23 14:47:19,711 [INFO] 
+2025-10-23 15:06:43,881 [INFO] 
 ======================================================================
-2025-10-23 14:47:19,711 [INFO] 📊 FINAL TRADING REPORT
-2025-10-23 14:47:19,712 [INFO] ======================================================================
-2025-10-23 14:47:19,712 [INFO] ⏱️  Runtime: 0h 14m
-2025-10-23 14:47:19,712 [INFO] 
+2025-10-23 15:06:43,881 [INFO] 📊 FINAL TRADING REPORT
+2025-10-23 15:06:43,881 [INFO] ======================================================================
+2025-10-23 15:06:43,882 [INFO] ⏱️  Runtime: 0h 1m
+2025-10-23 15:06:43,882 [INFO] 
 💰 Account Summary:
-2025-10-23 14:47:19,712 [INFO]    Starting Capital: ₹350.00
-2025-10-23 14:47:19,713 [INFO]    Final Equity:     ₹350.00
-2025-10-23 14:47:19,713 [INFO]    Final Cash:       ₹350.00
-2025-10-23 14:47:19,713 [INFO]    Total P&L:        ₹+0.00 (+0.00%)
-2025-10-23 14:47:19,713 [INFO] 
+2025-10-23 15:06:43,882 [INFO]    Starting Capital: ₹350.00
+2025-10-23 15:06:43,882 [INFO]    Final Equity:     ₹350.00
+2025-10-23 15:06:43,882 [INFO]    Final Cash:       ₹350.00
+2025-10-23 15:06:43,882 [INFO]    Total P&L:        ₹+0.00 (+0.00%)
+2025-10-23 15:06:43,882 [INFO] 
 📈 Trading Statistics:
-2025-10-23 14:47:19,713 [INFO]    Total Trades:     0
-2025-10-23 14:47:19,713 [INFO] ======================================================================
-2025-10-23 14:47:19,714 [INFO] ✅ Report saved to trading_bot.log
-2025-10-23 14:47:19,714 [INFO] ======================================================================
+2025-10-23 15:06:43,882 [INFO]    Total Trades:     0
+2025-10-23 15:06:43,882 [INFO] ======================================================================
+2025-10-23 15:06:43,882 [INFO] ✅ Report saved to trading_bot.log
+2025-10-23 15:06:43,882 [INFO] ======================================================================
 
+2025-10-23 15:19:26,402 [INFO] ======================================================================
+2025-10-23 15:19:26,402 [INFO] 🚀 CoinDCX Trading Bot
+2025-10-23 15:19:26,403 [INFO] Capital: ₹350.0 | Margin: ₹300.0
+2025-10-23 15:19:26,403 [INFO] Telegram: ❌ Disabled
+2025-10-23 15:19:26,403 [INFO] ======================================================================
+2025-10-23 15:19:26,665 [INFO] ✓ Retrieved 1073 markets
+2025-10-23 15:19:26,667 [INFO] ✅ Selected: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
+2025-10-23 15:19:26,667 [INFO] 
+📊 Initializing...
+2025-10-23 15:19:26,821 [INFO] ✓ I-TRX_INR    @ ₹ 30.1680 | Qty:    29.8329
+2025-10-23 15:19:26,978 [INFO] ✓ I-ADA_INR    @ ₹ 59.9260 | Qty:    15.0185
+2025-10-23 15:19:27,171 [INFO] ✓ I-ALGO_INR   @ ₹ 17.0870 | Qty:    52.6716
+2025-10-23 15:23:10,922 [INFO] ======================================================================
+2025-10-23 15:23:10,922 [INFO] 🚀 CoinDCX Trading Bot
+2025-10-23 15:23:10,922 [INFO] Capital: ₹350.0 | Margin: ₹300.0
+2025-10-23 15:23:10,923 [INFO] Telegram: ✅ Enabled
+2025-10-23 15:23:10,923 [INFO] ======================================================================
+2025-10-23 15:23:12,076 [INFO] ✓ Retrieved 1073 markets
+2025-10-23 15:23:12,078 [INFO] ✅ Selected: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
+2025-10-23 15:23:12,079 [INFO] 
+📊 Initializing...
+2025-10-23 15:23:14,415 [INFO] ✓ I-TRX_INR    @ ₹ 29.8600 | Qty:    30.1407
+2025-10-23 15:23:14,661 [INFO] ✓ I-ADA_INR    @ ₹ 59.9280 | Qty:    15.0180
+2025-10-23 15:23:14,768 [INFO] ✓ I-ALGO_INR   @ ₹ 17.0870 | Qty:    52.6716
+2025-10-23 15:23:14,875 [INFO] ✓ I-XRP_INR    @ ₹225.6901 | Qty:     3.9878
+2025-10-23 15:23:14,875 [INFO] 
+✓ Bot running | Press Ctrl+C to stop
+
+2025-10-23 15:24:15,020 [INFO] 🕯️ I-TRX_INR    ₹ 30.0870
+2025-10-23 15:24:15,199 [INFO] 🕯️ I-ADA_INR    ₹ 59.6010
+2025-10-23 15:24:15,442 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0870
+2025-10-23 15:24:15,614 [INFO] 🕯️ I-XRP_INR    ₹225.6901
+2025-10-23 15:25:16,927 [INFO] 🕯️ I-TRX_INR    ₹ 30.0870
+2025-10-23 15:25:17,082 [INFO] 🕯️ I-ADA_INR    ₹ 59.9560
+2025-10-23 15:25:17,208 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0870
+2025-10-23 15:25:17,370 [INFO] 🕯️ I-XRP_INR    ₹225.7298
+2025-10-23 15:26:18,549 [INFO] 🕯️ I-TRX_INR    ₹ 30.0870
+2025-10-23 15:26:18,701 [INFO] 🕯️ I-ADA_INR    ₹ 59.9550
+2025-10-23 15:26:18,861 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0870
+2025-10-23 15:26:19,015 [INFO] 🕯️ I-XRP_INR    ₹225.7298
+2025-10-23 19:59:09,848 [INFO] ======================================================================
+2025-10-23 19:59:09,849 [INFO] 🚀 CoinDCX Trading Bot
+2025-10-23 19:59:09,849 [INFO] Capital: ₹350.0 | Margin: ₹300.0
+2025-10-23 19:59:09,849 [INFO] Telegram: ✅ Enabled
+2025-10-23 19:59:09,849 [INFO] ======================================================================
+2025-10-23 19:59:11,621 [INFO] ✓ Retrieved 1073 markets
+2025-10-23 19:59:11,626 [INFO] ✅ Selected: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
+2025-10-23 19:59:11,629 [INFO] 
+📊 Initializing...
+2025-10-23 19:59:11,880 [INFO] ✓ I-TRX_INR    @ ₹ 29.8800 | Qty:    30.1205
+2025-10-23 19:59:12,066 [INFO] ✓ I-ADA_INR    @ ₹ 58.8150 | Qty:    15.3022
+2025-10-23 19:59:12,295 [INFO] ✓ I-ALGO_INR   @ ₹ 17.0040 | Qty:    52.9287
+2025-10-23 19:59:12,523 [INFO] ✓ I-XRP_INR    @ ₹223.4201 | Qty:     4.0283
+2025-10-23 19:59:12,525 [INFO] 
+✓ Bot running | Press Ctrl+C to stop
+
+2025-10-23 19:59:12,527 [INFO] ✓ Health server starting on port 8080
+2025-10-23 20:00:12,840 [INFO] 🕯️ I-TRX_INR    ₹ 29.8800
+2025-10-23 20:00:13,067 [INFO] 🕯️ I-ADA_INR    ₹ 59.3270
+2025-10-23 20:00:13,284 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0040
+2025-10-23 20:00:13,507 [INFO] 🕯️ I-XRP_INR    ₹223.4098
+2025-10-23 20:01:13,822 [INFO] 🕯️ I-TRX_INR    ₹ 29.8800
+2025-10-23 20:01:14,033 [INFO] 🕯️ I-ADA_INR    ₹ 59.3270
+2025-10-23 20:01:14,280 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0040
+2025-10-23 20:01:14,469 [INFO] 🕯️ I-XRP_INR    ₹223.5700
+2025-10-23 20:02:15,043 [INFO] 🕯️ I-TRX_INR    ₹ 29.8970
+2025-10-23 20:02:15,249 [INFO] 🕯️ I-ADA_INR    ₹ 59.3270
+2025-10-23 20:02:15,485 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0040
+2025-10-23 20:02:15,710 [INFO] 🕯️ I-XRP_INR    ₹223.5700
+2025-10-23 20:03:16,035 [INFO] 🕯️ I-TRX_INR    ₹ 29.8970
+2025-10-23 20:03:16,241 [INFO] 🕯️ I-ADA_INR    ₹ 59.3270
+2025-10-23 20:03:16,451 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:03:16,666 [INFO] 🕯️ I-XRP_INR    ₹222.0010
+2025-10-23 20:04:16,992 [INFO] 🕯️ I-TRX_INR    ₹ 29.8970
+2025-10-23 20:04:17,244 [INFO] 🕯️ I-ADA_INR    ₹ 58.8320
+2025-10-23 20:04:17,434 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:04:17,631 [INFO] 🕯️ I-XRP_INR    ₹222.0010
+2025-10-23 20:05:17,959 [INFO] 🕯️ I-TRX_INR    ₹ 29.8970
+2025-10-23 20:05:18,190 [INFO] 🕯️ I-ADA_INR    ₹ 59.6100
+2025-10-23 20:05:18,416 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:05:18,653 [INFO] 🕯️ I-XRP_INR    ₹223.6700
+2025-10-23 20:06:19,007 [INFO] 🕯️ I-TRX_INR    ₹ 29.8970
+2025-10-23 20:06:19,218 [INFO] 🕯️ I-ADA_INR    ₹ 59.0590
+2025-10-23 20:06:19,450 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:06:19,681 [INFO] 🕯️ I-XRP_INR    ₹223.6700
+2025-10-23 20:07:19,996 [INFO] 🕯️ I-TRX_INR    ₹ 29.8900
+2025-10-23 20:07:20,212 [INFO] 🕯️ I-ADA_INR    ₹ 59.7060
+2025-10-23 20:07:20,438 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:07:20,629 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:08:20,905 [INFO] 🕯️ I-TRX_INR    ₹ 29.8800
+2025-10-23 20:08:21,115 [INFO] 🕯️ I-ADA_INR    ₹ 59.7060
+2025-10-23 20:08:21,319 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:08:21,542 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:09:21,931 [INFO] 🕯️ I-TRX_INR    ₹ 29.9000
+2025-10-23 20:09:22,189 [INFO] 🕯️ I-ADA_INR    ₹ 59.7060
+2025-10-23 20:09:22,402 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:09:22,643 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:10:23,666 [INFO] 🕯️ I-TRX_INR    ₹ 29.9200
+2025-10-23 20:10:23,871 [INFO] 🕯️ I-ADA_INR    ₹ 59.7060
+2025-10-23 20:10:24,081 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:10:24,266 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:11:24,837 [INFO] 🕯️ I-TRX_INR    ₹ 29.9000
+2025-10-23 20:11:25,178 [INFO] 🕯️ I-ADA_INR    ₹ 59.7060
+2025-10-23 20:11:25,421 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:11:25,766 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:12:26,141 [INFO] 🕯️ I-TRX_INR    ₹ 29.6050
+2025-10-23 20:12:26,410 [INFO] 🕯️ I-ADA_INR    ₹ 59.7060
+2025-10-23 20:12:26,670 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:12:26,934 [INFO] 🕯️ I-XRP_INR    ₹223.9114
+2025-10-23 20:13:27,214 [INFO] 🕯️ I-TRX_INR    ₹ 29.6050
+2025-10-23 20:13:27,431 [INFO] 🕯️ I-ADA_INR    ₹ 59.7620
+2025-10-23 20:13:27,621 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0960
+2025-10-23 20:13:27,841 [INFO] 🕯️ I-XRP_INR    ₹223.8558
+2025-10-23 20:14:28,187 [INFO] 🕯️ I-TRX_INR    ₹ 29.6050
+2025-10-23 20:14:28,397 [INFO] 🕯️ I-ADA_INR    ₹ 59.1940
+2025-10-23 20:14:28,622 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1260
+2025-10-23 20:14:28,817 [INFO] 🕯️ I-XRP_INR    ₹223.7790
+2025-10-23 20:15:29,170 [INFO] 🕯️ I-TRX_INR    ₹ 29.8700
+2025-10-23 20:15:29,417 [INFO] 🕯️ I-ADA_INR    ₹ 59.1940
+2025-10-23 20:15:29,649 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:15:29,880 [INFO] 🕯️ I-XRP_INR    ₹223.7790
+2025-10-23 20:16:30,791 [INFO] 🕯️ I-TRX_INR    ₹ 29.8700
+2025-10-23 20:16:31,087 [INFO] 🕯️ I-ADA_INR    ₹ 59.1940
+2025-10-23 20:16:31,428 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:16:31,611 [INFO] 🕯️ I-XRP_INR    ₹222.2012
+2025-10-23 20:17:31,973 [INFO] 🕯️ I-TRX_INR    ₹ 29.9000
+2025-10-23 20:17:32,237 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:17:32,476 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:17:32,991 [INFO] 🕯️ I-XRP_INR    ₹223.9300
+2025-10-23 20:18:33,326 [INFO] 🕯️ I-TRX_INR    ₹ 29.6100
+2025-10-23 20:18:33,546 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:18:33,764 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:18:33,956 [INFO] 🕯️ I-XRP_INR    ₹222.4810
+2025-10-23 20:19:34,340 [INFO] 🕯️ I-TRX_INR    ₹ 29.6100
+2025-10-23 20:19:34,624 [INFO] 🕯️ I-ADA_INR    ₹ 59.2010
+2025-10-23 20:19:35,144 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:19:35,337 [INFO] 🕯️ I-XRP_INR    ₹222.3440
+2025-10-23 20:20:35,665 [INFO] 🕯️ I-TRX_INR    ₹ 29.6100
+2025-10-23 20:20:35,918 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:20:36,130 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:20:36,303 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:21:36,593 [INFO] 🕯️ I-TRX_INR    ₹ 29.8900
+2025-10-23 20:21:36,798 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:21:37,025 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:21:37,264 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:22:37,624 [INFO] 🕯️ I-TRX_INR    ₹ 29.8900
+2025-10-23 20:22:37,907 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:22:40,549 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:22:40,784 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:23:41,099 [INFO] 🕯️ I-TRX_INR    ₹ 29.6000
+2025-10-23 20:23:41,336 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:23:41,534 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:23:41,754 [INFO] 🕯️ I-XRP_INR    ₹223.0000
+2025-10-23 20:24:43,327 [INFO] 🕯️ I-TRX_INR    ₹ 29.8700
+2025-10-23 20:24:43,580 [INFO] 🕯️ I-ADA_INR    ₹ 59.6640
+2025-10-23 20:24:43,858 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:24:44,135 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:25:44,457 [INFO] 🕯️ I-TRX_INR    ₹ 29.8700
+2025-10-23 20:25:44,658 [INFO] 🕯️ I-ADA_INR    ₹ 59.6640
+2025-10-23 20:25:44,853 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:25:45,116 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:26:45,423 [INFO] 🕯️ I-TRX_INR    ₹ 29.9000
+2025-10-23 20:26:45,643 [INFO] 🕯️ I-ADA_INR    ₹ 59.7040
+2025-10-23 20:26:45,817 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:26:46,010 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:27:46,384 [INFO] 🕯️ I-TRX_INR    ₹ 29.9000
+2025-10-23 20:27:46,594 [INFO] 🕯️ I-ADA_INR    ₹ 59.6510
+2025-10-23 20:27:46,801 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1200
+2025-10-23 20:27:46,984 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:28:47,294 [INFO] 🕯️ I-TRX_INR    ₹ 29.9100
+2025-10-23 20:28:47,533 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:28:47,764 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:28:47,980 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:29:48,262 [INFO] 🕯️ I-TRX_INR    ₹ 29.9100
+2025-10-23 20:29:48,429 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:29:48,658 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:29:48,860 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:30:50,845 [INFO] 🕯️ I-TRX_INR    ₹ 29.9100
+2025-10-23 20:30:51,130 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:30:51,785 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:30:51,963 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:31:52,284 [INFO] 🕯️ I-TRX_INR    ₹ 29.6100
+2025-10-23 20:31:52,513 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:31:52,721 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:31:52,957 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:32:53,344 [INFO] 🕯️ I-TRX_INR    ₹ 29.8940
+2025-10-23 20:32:53,551 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:32:53,746 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:32:53,971 [INFO] 🕯️ I-XRP_INR    ₹223.7700
+2025-10-23 20:33:54,332 [INFO] 🕯️ I-TRX_INR    ₹ 29.8940
+2025-10-23 20:33:54,612 [INFO] 🕯️ I-ADA_INR    ₹ 59.2010
+2025-10-23 20:33:54,875 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:33:55,405 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 20:34:55,760 [INFO] 🕯️ I-TRX_INR    ₹ 29.8660
+2025-10-23 20:34:56,019 [INFO] 🕯️ I-ADA_INR    ₹ 59.2010
+2025-10-23 20:34:56,258 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:34:56,560 [INFO] 🕯️ I-XRP_INR    ₹224.5100
+2025-10-23 20:35:56,917 [INFO] 🕯️ I-TRX_INR    ₹ 29.8600
+2025-10-23 20:35:57,182 [INFO] 🕯️ I-ADA_INR    ₹ 59.2010
+2025-10-23 20:35:57,572 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:35:57,778 [INFO] 🕯️ I-XRP_INR    ₹224.1800
+2025-10-23 20:36:58,154 [INFO] 🕯️ I-TRX_INR    ₹ 29.8600
+2025-10-23 20:36:58,394 [INFO] 🕯️ I-ADA_INR    ₹ 59.2010
+2025-10-23 20:36:58,638 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:36:58,901 [INFO] 🕯️ I-XRP_INR    ₹223.7700
+2025-10-23 20:37:59,227 [INFO] 🕯️ I-TRX_INR    ₹ 29.8600
+2025-10-23 20:37:59,541 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:38:00,109 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:38:00,569 [INFO] 🕯️ I-XRP_INR    ₹224.3300
+2025-10-23 20:39:00,874 [INFO] 🕯️ I-TRX_INR    ₹ 29.6000
+2025-10-23 20:39:01,268 [INFO] 🕯️ I-ADA_INR    ₹ 59.7110
+2025-10-23 20:39:01,554 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:39:02,869 [INFO] 🕯️ I-XRP_INR    ₹223.7700
+2025-10-23 20:40:03,229 [INFO] 🕯️ I-TRX_INR    ₹ 29.6000
+2025-10-23 20:40:03,577 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:40:04,425 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:40:04,649 [INFO] 🕯️ I-XRP_INR    ₹224.2500
+2025-10-23 20:41:05,559 [INFO] 🕯️ I-TRX_INR    ₹ 29.6000
+2025-10-23 20:41:05,787 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:41:06,016 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:41:06,212 [INFO] 🕯️ I-XRP_INR    ₹225.1900
+2025-10-23 20:42:06,593 [INFO] 🕯️ I-TRX_INR    ₹ 29.8270
+2025-10-23 20:42:06,796 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:42:06,990 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:42:07,221 [INFO] 🕯️ I-XRP_INR    ₹225.3800
+2025-10-23 20:43:07,767 [INFO] 🕯️ I-TRX_INR    ₹ 29.7800
+2025-10-23 20:43:08,250 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:43:09,592 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:43:09,869 [INFO] 🕯️ I-XRP_INR    ₹225.2400
+2025-10-23 20:44:10,212 [INFO] 🕯️ I-TRX_INR    ₹ 29.7830
+2025-10-23 20:44:10,450 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:44:10,713 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:44:10,912 [INFO] 🕯️ I-XRP_INR    ₹225.2400
+2025-10-23 20:45:11,233 [INFO] 🕯️ I-TRX_INR    ₹ 29.7840
+2025-10-23 20:45:11,442 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:45:11,683 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:45:11,924 [INFO] 🕯️ I-XRP_INR    ₹225.3668
+2025-10-23 20:46:12,665 [INFO] 🕯️ I-TRX_INR    ₹ 29.5500
+2025-10-23 20:46:12,666 [INFO] 📈 OPENED SELL I-TRX_INR qty=30.4569 @ ₹29.5500
+2025-10-23 20:46:14,394 [INFO] 🕯️ I-ADA_INR    ₹ 59.7120
+2025-10-23 20:46:14,636 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:46:14,850 [INFO] 🕯️ I-XRP_INR    ₹225.3668
+2025-10-23 20:47:16,406 [INFO] 🕯️ I-TRX_INR    ₹ 29.7450
+2025-10-23 20:47:16,679 [INFO] 🕯️ I-ADA_INR    ₹ 59.9600
+2025-10-23 20:47:16,925 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:47:17,270 [INFO] 🕯️ I-XRP_INR    ₹225.2299
+2025-10-23 20:48:19,098 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 20:48:19,362 [INFO] 🕯️ I-ADA_INR    ₹ 59.9590
+2025-10-23 20:48:19,630 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:48:20,441 [INFO] 🕯️ I-XRP_INR    ₹223.7700
+2025-10-23 20:49:22,198 [INFO] 🕯️ I-TRX_INR    ₹ 29.7300
+2025-10-23 20:49:22,474 [INFO] 🕯️ I-ADA_INR    ₹ 59.9590
+2025-10-23 20:49:23,149 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:49:23,374 [INFO] 🕯️ I-XRP_INR    ₹225.0099
+2025-10-23 20:50:25,100 [INFO] 🕯️ I-TRX_INR    ₹ 29.6800
+2025-10-23 20:50:25,365 [INFO] 🕯️ I-ADA_INR    ₹ 59.9590
+2025-10-23 20:50:25,619 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:50:26,163 [INFO] 🕯️ I-XRP_INR    ₹224.5900
+2025-10-23 20:51:27,753 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 20:51:28,043 [INFO] 🕯️ I-ADA_INR    ₹ 59.3540
+2025-10-23 20:51:28,344 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:51:28,700 [INFO] 🕯️ I-XRP_INR    ₹224.6500
+2025-10-23 20:52:35,605 [INFO] 🕯️ I-TRX_INR    ₹ 29.6400
+2025-10-23 20:52:35,857 [INFO] 🕯️ I-ADA_INR    ₹ 59.3540
+2025-10-23 20:52:36,104 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:52:36,402 [INFO] 🕯️ I-XRP_INR    ₹224.4600
+2025-10-23 20:53:38,084 [INFO] 🕯️ I-TRX_INR    ₹ 29.6400
+2025-10-23 20:53:38,300 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 20:53:38,525 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:53:38,742 [INFO] 🕯️ I-XRP_INR    ₹223.7700
+2025-10-23 20:54:40,579 [INFO] 🕯️ I-TRX_INR    ₹ 29.5100
+2025-10-23 20:54:40,823 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 20:54:41,037 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:54:41,240 [INFO] 🕯️ I-XRP_INR    ₹224.8300
+2025-10-23 20:55:42,825 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 20:55:43,047 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 20:55:43,219 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:55:43,480 [INFO] 🕯️ I-XRP_INR    ₹224.8170
+2025-10-23 20:56:45,305 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 20:56:45,523 [INFO] 🕯️ I-ADA_INR    ₹ 59.3540
+2025-10-23 20:56:45,788 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:56:46,025 [INFO] 🕯️ I-XRP_INR    ₹224.8009
+2025-10-23 20:57:48,067 [INFO] 🕯️ I-TRX_INR    ₹ 29.4950
+2025-10-23 20:57:48,284 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 20:57:48,490 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:57:48,708 [INFO] 🕯️ I-XRP_INR    ₹224.7831
+2025-10-23 20:58:50,325 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 20:58:50,567 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 20:58:50,807 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:58:51,008 [INFO] 🕯️ I-XRP_INR    ₹224.9535
+2025-10-23 20:59:52,934 [INFO] 🕯️ I-TRX_INR    ₹ 29.4700
+2025-10-23 20:59:53,171 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 20:59:53,414 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 20:59:53,637 [INFO] 🕯️ I-XRP_INR    ₹223.7700
+2025-10-23 21:00:55,006 [INFO] 🕯️ I-TRX_INR    ₹ 29.5100
+2025-10-23 21:00:55,237 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 21:00:55,489 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 21:00:55,787 [INFO] 🕯️ I-XRP_INR    ₹224.9500
+2025-10-23 21:01:57,279 [INFO] 🕯️ I-TRX_INR    ₹ 29.4900
+2025-10-23 21:01:57,459 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 21:01:57,656 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 21:01:57,879 [INFO] 🕯️ I-XRP_INR    ₹225.3509
+2025-10-23 21:02:59,410 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 21:02:59,691 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 21:03:00,185 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 21:03:00,388 [INFO] 🕯️ I-XRP_INR    ₹225.3490
+2025-10-23 21:04:01,910 [INFO] 🕯️ I-TRX_INR    ₹ 29.4600
+2025-10-23 21:04:02,194 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 21:04:02,397 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1470
+2025-10-23 21:04:02,615 [INFO] 🕯️ I-XRP_INR    ₹225.3490
+2025-10-23 21:05:03,999 [INFO] 🕯️ I-TRX_INR    ₹ 29.4600
+2025-10-23 21:05:04,192 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 21:05:04,413 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:05:04,659 [INFO] 🕯️ I-XRP_INR    ₹223.7810
+2025-10-23 21:06:06,942 [INFO] 🕯️ I-TRX_INR    ₹ 29.4600
+2025-10-23 21:06:07,155 [INFO] 🕯️ I-ADA_INR    ₹ 59.8770
+2025-10-23 21:06:07,385 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:06:07,616 [INFO] 🕯️ I-XRP_INR    ₹225.6358
+2025-10-23 21:07:09,958 [INFO] 🕯️ I-TRX_INR    ₹ 29.4600
+2025-10-23 21:07:10,185 [INFO] 🕯️ I-ADA_INR    ₹ 59.9990
+2025-10-23 21:07:10,393 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:07:10,691 [INFO] 🕯️ I-XRP_INR    ₹225.5494
+2025-10-23 21:08:12,616 [INFO] 🕯️ I-TRX_INR    ₹ 29.4600
+2025-10-23 21:08:12,838 [INFO] 🕯️ I-ADA_INR    ₹ 60.1200
+2025-10-23 21:08:13,030 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:08:13,266 [INFO] 🕯️ I-XRP_INR    ₹225.3946
+2025-10-23 21:09:14,799 [INFO] 🕯️ I-TRX_INR    ₹ 29.5800
+2025-10-23 21:09:15,036 [INFO] 🕯️ I-ADA_INR    ₹ 60.1190
+2025-10-23 21:09:15,308 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:09:15,542 [INFO] 🕯️ I-XRP_INR    ₹225.4200
+2025-10-23 21:10:17,140 [INFO] 🕯️ I-TRX_INR    ₹ 29.5400
+2025-10-23 21:10:17,368 [INFO] 🕯️ I-ADA_INR    ₹ 60.1190
+2025-10-23 21:10:17,607 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:10:17,831 [INFO] 🕯️ I-XRP_INR    ₹225.4899
+2025-10-23 21:11:21,014 [INFO] 🕯️ I-TRX_INR    ₹ 29.5400
+2025-10-23 21:11:21,222 [INFO] 🕯️ I-ADA_INR    ₹ 60.1190
+2025-10-23 21:11:21,445 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:11:21,674 [INFO] 🕯️ I-XRP_INR    ₹225.2782
+2025-10-23 21:12:23,058 [INFO] 🕯️ I-TRX_INR    ₹ 29.5400
+2025-10-23 21:12:23,309 [INFO] 🕯️ I-ADA_INR    ₹ 60.1190
+2025-10-23 21:12:23,528 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:12:23,766 [INFO] 🕯️ I-XRP_INR    ₹223.7800
+2025-10-23 21:13:25,469 [INFO] 🕯️ I-TRX_INR    ₹ 29.5400
+2025-10-23 21:13:25,718 [INFO] 🕯️ I-ADA_INR    ₹ 60.1190
+2025-10-23 21:13:25,926 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:13:26,197 [INFO] 🕯️ I-XRP_INR    ₹225.3852
+2025-10-23 21:14:27,585 [INFO] 🕯️ I-TRX_INR    ₹ 29.4800
+2025-10-23 21:14:27,751 [INFO] 🕯️ I-ADA_INR    ₹ 60.0000
+2025-10-23 21:14:27,911 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:14:28,144 [INFO] 🕯️ I-XRP_INR    ₹225.0948
+2025-10-23 21:15:29,538 [INFO] 🕯️ I-TRX_INR    ₹ 29.4700
+2025-10-23 21:15:29,692 [INFO] 🕯️ I-ADA_INR    ₹ 59.9310
+2025-10-23 21:15:29,862 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:15:30,052 [INFO] 🕯️ I-XRP_INR    ₹223.7800
+2025-10-23 21:16:31,452 [INFO] 🕯️ I-TRX_INR    ₹ 29.4700
+2025-10-23 21:16:31,751 [INFO] 🕯️ I-ADA_INR    ₹ 59.9080
+2025-10-23 21:16:31,956 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:16:32,183 [INFO] 🕯️ I-XRP_INR    ₹225.0000
+2025-10-23 21:17:33,723 [INFO] 🕯️ I-TRX_INR    ₹ 29.5400
+2025-10-23 21:17:33,937 [INFO] 🕯️ I-ADA_INR    ₹ 60.1740
+2025-10-23 21:17:34,194 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:17:34,390 [INFO] 🕯️ I-XRP_INR    ₹225.1000
+2025-10-23 21:18:35,668 [INFO] 🕯️ I-TRX_INR    ₹ 29.5200
+2025-10-23 21:18:35,875 [INFO] 🕯️ I-ADA_INR    ₹ 60.1740
+2025-10-23 21:18:36,114 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:18:36,335 [INFO] 🕯️ I-XRP_INR    ₹225.3100
+2025-10-23 21:19:39,217 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 21:19:39,417 [INFO] 🕯️ I-ADA_INR    ₹ 60.1740
+2025-10-23 21:19:39,654 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:19:39,869 [INFO] 🕯️ I-XRP_INR    ₹225.4190
+2025-10-23 21:20:51,468 [INFO] ======================================================================
+2025-10-23 21:20:51,469 [INFO] 🚀 CoinDCX Scalping Bot
+2025-10-23 21:20:51,469 [INFO] Capital: ₹350.0 | Margin: ₹300.0 | Leverage: 3x
+2025-10-23 21:20:51,470 [INFO] Strategy: TP=0.8% | SL=0.4% | R:R = 1:2.0
+2025-10-23 21:20:51,470 [INFO] Protection: 120s minimum hold | Emergency SL: 2.0%
+2025-10-23 21:20:51,470 [INFO] Telegram: ✅ Enabled
+2025-10-23 21:20:51,470 [INFO] ======================================================================
+2025-10-23 21:20:53,221 [INFO] ✓ Retrieved 1073 markets
+2025-10-23 21:20:53,223 [INFO] ✅ Selected: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
+2025-10-23 21:20:53,224 [INFO] 
+📊 Initializing...
+2025-10-23 21:20:53,431 [INFO] ✓ I-TRX_INR    @ ₹ 29.5400 | Qty:    30.4672
+2025-10-23 21:20:53,617 [INFO] ✓ I-ADA_INR    @ ₹ 60.1210 | Qty:    14.9698
+2025-10-23 21:20:53,786 [INFO] ✓ I-ALGO_INR   @ ₹ 17.2130 | Qty:    52.2861
+2025-10-23 21:20:53,953 [INFO] ✓ I-XRP_INR    @ ₹225.4190 | Qty:     3.9926
+2025-10-23 21:20:53,953 [INFO] 
+✓ Scalping bot running | Press Ctrl+C to stop
+
+2025-10-23 21:20:53,954 [INFO] ✓ Health server starting on port 8080
+2025-10-23 21:21:24,292 [INFO] 🕯️ I-TRX_INR    ₹ 29.5400
+2025-10-23 21:21:24,584 [INFO] 🕯️ I-ADA_INR    ₹ 60.1210
+2025-10-23 21:21:24,826 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:21:25,001 [INFO] 🕯️ I-XRP_INR    ₹225.3889
+2025-10-23 21:22:26,146 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 21:22:26,371 [INFO] 🕯️ I-ADA_INR    ₹ 60.1210
+2025-10-23 21:22:26,605 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:22:26,831 [INFO] 🕯️ I-XRP_INR    ₹225.3854
+2025-10-23 21:23:28,041 [INFO] 🕯️ I-TRX_INR    ₹ 29.5200
+2025-10-23 21:23:28,308 [INFO] 🕯️ I-ADA_INR    ₹ 60.1210
+2025-10-23 21:23:28,509 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:23:28,731 [INFO] 🕯️ I-XRP_INR    ₹225.3843
+2025-10-23 21:24:30,116 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 21:24:30,333 [INFO] 🕯️ I-ADA_INR    ₹ 60.1740
+2025-10-23 21:24:30,577 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:24:30,799 [INFO] 🕯️ I-XRP_INR    ₹225.3778
+2025-10-23 21:25:01,116 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 21:25:01,344 [INFO] 🕯️ I-ADA_INR    ₹ 59.9080
+2025-10-23 21:25:01,563 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:25:01,760 [INFO] 🕯️ I-XRP_INR    ₹225.3778
+2025-10-23 21:26:03,040 [INFO] 🕯️ I-TRX_INR    ₹ 29.5600
+2025-10-23 21:26:03,284 [INFO] 🕯️ I-ADA_INR    ₹ 60.1800
+2025-10-23 21:26:03,467 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:26:03,674 [INFO] 🕯️ I-XRP_INR    ₹225.3723
+2025-10-23 21:27:04,876 [INFO] 🕯️ I-TRX_INR    ₹ 29.5600
+2025-10-23 21:27:05,093 [INFO] 🕯️ I-ADA_INR    ₹ 59.9080
+2025-10-23 21:27:05,289 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:27:05,486 [INFO] 🕯️ I-XRP_INR    ₹225.3679
+2025-10-23 21:28:06,764 [INFO] 🕯️ I-TRX_INR    ₹ 29.5600
+2025-10-23 21:28:06,945 [INFO] 🕯️ I-ADA_INR    ₹ 60.1590
+2025-10-23 21:28:07,146 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:28:07,342 [INFO] 🕯️ I-XRP_INR    ₹225.3699
+2025-10-23 21:29:08,622 [INFO] 🕯️ I-TRX_INR    ₹ 29.5880
+2025-10-23 21:29:08,867 [INFO] 🕯️ I-ADA_INR    ₹ 60.1590
+2025-10-23 21:29:09,113 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:29:09,391 [INFO] 🕯️ I-XRP_INR    ₹225.3566
+2025-10-23 21:30:10,585 [INFO] 🕯️ I-TRX_INR    ₹ 29.5880
+2025-10-23 21:30:10,806 [INFO] 🕯️ I-ADA_INR    ₹ 60.0470
+2025-10-23 21:30:11,016 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:30:11,238 [INFO] 🕯️ I-XRP_INR    ₹225.3511
+2025-10-23 21:31:12,429 [INFO] 🕯️ I-TRX_INR    ₹ 29.5880
+2025-10-23 21:31:12,619 [INFO] 🕯️ I-ADA_INR    ₹ 60.0840
+2025-10-23 21:31:12,805 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:31:12,994 [INFO] 🕯️ I-XRP_INR    ₹225.1500
+2025-10-23 21:32:15,126 [INFO] 🕯️ I-TRX_INR    ₹ 29.4800
+2025-10-23 21:32:15,415 [INFO] 🕯️ I-ADA_INR    ₹ 59.9000
+2025-10-23 21:32:15,689 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:32:16,890 [INFO] 🕯️ I-XRP_INR    ₹225.3489
+2025-10-23 21:33:18,037 [INFO] 🕯️ I-TRX_INR    ₹ 29.5030
+2025-10-23 21:33:18,230 [INFO] 🕯️ I-ADA_INR    ₹ 59.9080
+2025-10-23 21:33:18,424 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:33:18,616 [INFO] 🕯️ I-XRP_INR    ₹225.3100
+2025-10-23 21:34:19,750 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 21:34:19,953 [INFO] 🕯️ I-ADA_INR    ₹ 59.9080
+2025-10-23 21:34:20,155 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:34:20,361 [INFO] 🕯️ I-XRP_INR    ₹225.3489
+2025-10-23 21:35:22,442 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 21:35:22,633 [INFO] 🕯️ I-ADA_INR    ₹ 59.9080
+2025-10-23 21:35:22,832 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:35:23,035 [INFO] 🕯️ I-XRP_INR    ₹225.3455
+2025-10-23 21:36:24,144 [INFO] 🕯️ I-TRX_INR    ₹ 29.4600
+2025-10-23 21:36:24,361 [INFO] 🕯️ I-ADA_INR    ₹ 59.9080
+2025-10-23 21:36:24,548 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:36:24,750 [INFO] 🕯️ I-XRP_INR    ₹225.3433
+2025-10-23 21:37:25,940 [INFO] 🕯️ I-TRX_INR    ₹ 29.4500
+2025-10-23 21:37:26,203 [INFO] 🕯️ I-ADA_INR    ₹ 59.9000
+2025-10-23 21:37:26,465 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:37:27,184 [INFO] 🕯️ I-XRP_INR    ₹223.7800
+2025-10-23 21:38:28,434 [INFO] 🕯️ I-TRX_INR    ₹ 29.4100
+2025-10-23 21:38:28,634 [INFO] 🕯️ I-ADA_INR    ₹ 60.0190
+2025-10-23 21:38:28,838 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:38:29,035 [INFO] 🕯️ I-XRP_INR    ₹225.1798
+2025-10-23 21:39:00,325 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:39:00,524 [INFO] 🕯️ I-XRP_INR    ₹224.9793
+2025-10-23 21:39:30,858 [INFO] 🕯️ I-TRX_INR    ₹ 29.4100
+2025-10-23 21:39:31,047 [INFO] 🕯️ I-ADA_INR    ₹ 59.9360
+2025-10-23 21:40:01,819 [INFO] 🕯️ I-TRX_INR    ₹ 29.4100
+2025-10-23 21:40:02,017 [INFO] 🕯️ I-ADA_INR    ₹ 59.9360
+2025-10-23 21:40:02,239 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:40:02,424 [INFO] 🕯️ I-XRP_INR    ₹224.9774
+2025-10-23 21:41:03,519 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 21:41:03,707 [INFO] 🕯️ I-ADA_INR    ₹ 59.9770
+2025-10-23 21:41:03,899 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:41:04,108 [INFO] 🕯️ I-XRP_INR    ₹224.8051
+2025-10-23 21:42:05,244 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 21:42:05,442 [INFO] 🕯️ I-ADA_INR    ₹ 59.9960
+2025-10-23 21:42:05,646 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2130
+2025-10-23 21:42:05,846 [INFO] 🕯️ I-XRP_INR    ₹224.9299
+2025-10-23 21:43:06,992 [INFO] 🕯️ I-TRX_INR    ₹ 29.3610
+2025-10-23 21:43:07,169 [INFO] 🕯️ I-ADA_INR    ₹ 60.1200
+2025-10-23 21:43:07,358 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1890
+2025-10-23 21:43:07,557 [INFO] 🕯️ I-XRP_INR    ₹224.9500
+2025-10-23 21:44:08,627 [INFO] 🕯️ I-TRX_INR    ₹ 29.3900
+2025-10-23 21:44:08,816 [INFO] 🕯️ I-ADA_INR    ₹ 60.0880
+2025-10-23 21:44:09,001 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1890
+2025-10-23 21:44:09,200 [INFO] 🕯️ I-XRP_INR    ₹225.2653
+2025-10-23 21:45:10,364 [INFO] 🕯️ I-TRX_INR    ₹ 29.3900
+2025-10-23 21:45:10,559 [INFO] 🕯️ I-ADA_INR    ₹ 60.0820
+2025-10-23 21:45:10,734 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1890
+2025-10-23 21:45:10,917 [INFO] 🕯️ I-XRP_INR    ₹223.7800
+2025-10-23 21:46:12,004 [INFO] 🕯️ I-TRX_INR    ₹ 29.1910
+2025-10-23 21:46:12,201 [INFO] 🕯️ I-ADA_INR    ₹ 60.0820
+2025-10-23 21:46:12,409 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1890
+2025-10-23 21:46:12,612 [INFO] 🕯️ I-XRP_INR    ₹225.2799
+2025-10-23 21:47:13,754 [INFO] 🕯️ I-TRX_INR    ₹ 29.3900
+2025-10-23 21:47:13,952 [INFO] 🕯️ I-ADA_INR    ₹ 60.0980
+2025-10-23 21:47:14,160 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:47:14,361 [INFO] 🕯️ I-XRP_INR    ₹225.2840
+2025-10-23 21:48:15,509 [INFO] 🕯️ I-TRX_INR    ₹ 29.3600
+2025-10-23 21:48:15,697 [INFO] 🕯️ I-ADA_INR    ₹ 59.3900
+2025-10-23 21:48:15,894 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:48:16,080 [INFO] 🕯️ I-XRP_INR    ₹225.0179
+2025-10-23 21:49:17,212 [INFO] 🕯️ I-TRX_INR    ₹ 29.3600
+2025-10-23 21:49:17,394 [INFO] 🕯️ I-ADA_INR    ₹ 59.3900
+2025-10-23 21:49:17,575 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:49:17,762 [INFO] 🕯️ I-XRP_INR    ₹225.1823
+2025-10-23 21:50:18,907 [INFO] 🕯️ I-TRX_INR    ₹ 29.3600
+2025-10-23 21:50:19,158 [INFO] 🕯️ I-ADA_INR    ₹ 60.1270
+2025-10-23 21:50:19,353 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:50:19,564 [INFO] 🕯️ I-XRP_INR    ₹225.1802
+2025-10-23 21:51:20,725 [INFO] 🕯️ I-TRX_INR    ₹ 29.3300
+2025-10-23 21:51:20,934 [INFO] 🕯️ I-ADA_INR    ₹ 60.1270
+2025-10-23 21:51:21,165 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:51:21,346 [INFO] 🕯️ I-XRP_INR    ₹225.1794
+2025-10-23 21:52:24,503 [INFO] 🕯️ I-TRX_INR    ₹ 29.3300
+2025-10-23 21:52:24,677 [INFO] 🕯️ I-ADA_INR    ₹ 60.1790
+2025-10-23 21:52:24,864 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:52:25,053 [INFO] 🕯️ I-XRP_INR    ₹225.1777
+2025-10-23 21:53:26,241 [INFO] 🕯️ I-TRX_INR    ₹ 29.3400
+2025-10-23 21:53:26,422 [INFO] 🕯️ I-ADA_INR    ₹ 60.1010
+2025-10-23 21:53:26,614 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:53:26,815 [INFO] 🕯️ I-XRP_INR    ₹224.9477
+2025-10-23 21:54:27,911 [INFO] 🕯️ I-TRX_INR    ₹ 29.2500
+2025-10-23 21:54:28,193 [INFO] 🕯️ I-ADA_INR    ₹ 60.0950
+2025-10-23 21:54:28,397 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:54:28,610 [INFO] 🕯️ I-XRP_INR    ₹224.5099
+2025-10-23 21:55:29,747 [INFO] 🕯️ I-TRX_INR    ₹ 29.2500
+2025-10-23 21:55:29,957 [INFO] 🕯️ I-ADA_INR    ₹ 60.1500
+2025-10-23 21:55:30,160 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:55:30,350 [INFO] 🕯️ I-XRP_INR    ₹224.4274
+2025-10-23 21:56:00,561 [INFO] 🕯️ I-TRX_INR    ₹ 29.2800
+2025-10-23 21:56:00,773 [INFO] 🕯️ I-ADA_INR    ₹ 60.1300
+2025-10-23 21:56:00,974 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:56:01,186 [INFO] 🕯️ I-XRP_INR    ₹224.6026
+2025-10-23 21:57:02,229 [INFO] 🕯️ I-TRX_INR    ₹ 29.3100
+2025-10-23 21:57:02,417 [INFO] 🕯️ I-ADA_INR    ₹ 60.1370
+2025-10-23 21:57:02,585 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:57:02,777 [INFO] 🕯️ I-XRP_INR    ₹224.5499
+2025-10-23 21:58:03,960 [INFO] 🕯️ I-TRX_INR    ₹ 29.2900
+2025-10-23 21:58:04,152 [INFO] 🕯️ I-ADA_INR    ₹ 60.1900
+2025-10-23 21:58:04,347 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:58:04,542 [INFO] 🕯️ I-XRP_INR    ₹224.4224
+2025-10-23 21:59:05,604 [INFO] 🕯️ I-TRX_INR    ₹ 29.3000
+2025-10-23 21:59:05,809 [INFO] 🕯️ I-ADA_INR    ₹ 60.1760
+2025-10-23 21:59:05,990 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 21:59:06,177 [INFO] 🕯️ I-XRP_INR    ₹224.4737
+2025-10-23 22:00:07,280 [INFO] 🕯️ I-TRX_INR    ₹ 29.3000
+2025-10-23 22:00:07,488 [INFO] 🕯️ I-ADA_INR    ₹ 60.1760
+2025-10-23 22:00:07,693 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 22:00:07,878 [INFO] 🕯️ I-XRP_INR    ₹224.2497
+2025-10-23 22:01:08,957 [INFO] 🕯️ I-TRX_INR    ₹ 29.2400
+2025-10-23 22:01:09,131 [INFO] 🕯️ I-ADA_INR    ₹ 60.1280
+2025-10-23 22:01:09,331 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 22:01:09,534 [INFO] 🕯️ I-XRP_INR    ₹224.3300
+2025-10-23 22:02:10,651 [INFO] 🕯️ I-TRX_INR    ₹ 29.2900
+2025-10-23 22:02:10,857 [INFO] 🕯️ I-ADA_INR    ₹ 60.1130
+2025-10-23 22:02:11,037 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 22:02:11,234 [INFO] 🕯️ I-XRP_INR    ₹224.3950
+2025-10-23 22:03:13,359 [INFO] 🕯️ I-TRX_INR    ₹ 29.2900
+2025-10-23 22:03:13,544 [INFO] 🕯️ I-ADA_INR    ₹ 60.1050
+2025-10-23 22:03:13,730 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1910
+2025-10-23 22:03:13,934 [INFO] 🕯️ I-XRP_INR    ₹223.2100
+2025-10-23 22:04:15,052 [INFO] 🕯️ I-TRX_INR    ₹ 29.2900
+2025-10-23 22:04:15,262 [INFO] 🕯️ I-ADA_INR    ₹ 60.0000
+2025-10-23 22:04:15,451 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2220
+2025-10-23 22:04:15,660 [INFO] 🕯️ I-XRP_INR    ₹223.2100
+2025-10-23 22:05:16,806 [INFO] 🕯️ I-TRX_INR    ₹ 29.3200
+2025-10-23 22:05:16,982 [INFO] 🕯️ I-ADA_INR    ₹ 60.1170
+2025-10-23 22:05:17,178 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2220
+2025-10-23 22:05:17,403 [INFO] 🕯️ I-XRP_INR    ₹224.3754
+2025-10-23 22:06:18,460 [INFO] 🕯️ I-TRX_INR    ₹ 29.3200
+2025-10-23 22:06:18,679 [INFO] 🕯️ I-ADA_INR    ₹ 59.9980
+2025-10-23 22:06:18,884 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2220
+2025-10-23 22:06:19,092 [INFO] 🕯️ I-XRP_INR    ₹224.1373
+2025-10-23 22:07:20,142 [INFO] 🕯️ I-TRX_INR    ₹ 29.3000
+2025-10-23 22:07:20,341 [INFO] 🕯️ I-ADA_INR    ₹ 60.1040
+2025-10-23 22:07:20,490 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2220
+2025-10-23 22:07:20,710 [INFO] 🕯️ I-XRP_INR    ₹224.1828
+2025-10-23 22:08:21,796 [INFO] 🕯️ I-TRX_INR    ₹ 29.4190
+2025-10-23 22:08:21,974 [INFO] 🕯️ I-ADA_INR    ₹ 59.3630
+2025-10-23 22:08:22,182 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2220
+2025-10-23 22:08:22,388 [INFO] 🕯️ I-XRP_INR    ₹224.3728
+2025-10-23 22:09:23,605 [INFO] 🕯️ I-TRX_INR    ₹ 29.3000
+2025-10-23 22:09:23,821 [INFO] 🕯️ I-ADA_INR    ₹ 60.0440
+2025-10-23 22:09:24,062 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2220
+2025-10-23 22:09:24,337 [INFO] 🕯️ I-XRP_INR    ₹224.2324
+2025-10-23 22:10:25,658 [INFO] 🕯️ I-TRX_INR    ₹ 29.3900
+2025-10-23 22:10:25,888 [INFO] 🕯️ I-ADA_INR    ₹ 60.0440
+2025-10-23 22:10:26,125 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:10:26,364 [INFO] 🕯️ I-XRP_INR    ₹224.0000
+2025-10-23 22:11:27,572 [INFO] 🕯️ I-TRX_INR    ₹ 29.3320
+2025-10-23 22:11:27,809 [INFO] 🕯️ I-ADA_INR    ₹ 60.0130
+2025-10-23 22:11:28,033 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:11:28,310 [INFO] 🕯️ I-XRP_INR    ₹223.5600
+2025-10-23 22:12:00,184 [INFO] 🕯️ I-XRP_INR    ₹223.7400
+2025-10-23 22:12:30,453 [INFO] 🕯️ I-TRX_INR    ₹ 29.3320
+2025-10-23 22:12:30,683 [INFO] 🕯️ I-ADA_INR    ₹ 60.0130
+2025-10-23 22:12:30,927 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:13:01,462 [INFO] 🕯️ I-TRX_INR    ₹ 29.3320
+2025-10-23 22:13:01,869 [INFO] 🕯️ I-ADA_INR    ₹ 60.0130
+2025-10-23 22:13:02,096 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:13:02,330 [INFO] 🕯️ I-XRP_INR    ₹223.0000
+2025-10-23 22:14:03,697 [INFO] 🕯️ I-TRX_INR    ₹ 29.3320
+2025-10-23 22:14:03,927 [INFO] 🕯️ I-ADA_INR    ₹ 59.4600
+2025-10-23 22:14:04,201 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:14:04,473 [INFO] 🕯️ I-XRP_INR    ₹223.8600
+2025-10-23 22:15:05,730 [INFO] 🕯️ I-TRX_INR    ₹ 29.3320
+2025-10-23 22:15:06,096 [INFO] 🕯️ I-ADA_INR    ₹ 59.3580
+2025-10-23 22:15:06,321 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:15:06,570 [INFO] 🕯️ I-XRP_INR    ₹223.9600
+2025-10-23 22:16:07,915 [INFO] 🕯️ I-TRX_INR    ₹ 29.3000
+2025-10-23 22:16:08,168 [INFO] 🕯️ I-ADA_INR    ₹ 60.1010
+2025-10-23 22:16:08,393 [INFO] 🕯️ I-ALGO_INR   ₹ 16.9400
+2025-10-23 22:16:08,636 [INFO] 🕯️ I-XRP_INR    ₹223.9300
+2025-10-23 22:17:10,001 [INFO] 🕯️ I-TRX_INR    ₹ 29.3000
+2025-10-23 22:17:10,251 [INFO] 🕯️ I-ADA_INR    ₹ 60.1760
+2025-10-23 22:17:10,499 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:17:10,739 [INFO] 🕯️ I-XRP_INR    ₹224.0300
+2025-10-23 22:18:12,280 [INFO] 🕯️ I-TRX_INR    ₹ 29.2700
+2025-10-23 22:18:12,549 [INFO] 🕯️ I-ADA_INR    ₹ 60.1760
+2025-10-23 22:18:12,865 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:18:13,101 [INFO] 🕯️ I-XRP_INR    ₹224.0700
+2025-10-23 22:19:14,243 [INFO] 🕯️ I-TRX_INR    ₹ 29.3200
+2025-10-23 22:19:14,511 [INFO] 🕯️ I-ADA_INR    ₹ 59.4710
+2025-10-23 22:19:14,780 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:19:15,001 [INFO] 🕯️ I-XRP_INR    ₹223.0011
+2025-10-23 22:20:16,285 [INFO] 🕯️ I-TRX_INR    ₹ 29.3460
+2025-10-23 22:20:16,526 [INFO] 🕯️ I-ADA_INR    ₹ 60.2750
+2025-10-23 22:20:16,778 [INFO] 🕯️ I-ALGO_INR   ₹ 17.0000
+2025-10-23 22:20:17,004 [INFO] 🕯️ I-XRP_INR    ₹224.6699
+2025-10-23 22:21:18,336 [INFO] 🕯️ I-TRX_INR    ₹ 29.3000
+2025-10-23 22:21:18,592 [INFO] 🕯️ I-ADA_INR    ₹ 60.2540
+2025-10-23 22:21:18,850 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:21:19,099 [INFO] 🕯️ I-XRP_INR    ₹224.6698
+2025-10-23 22:22:21,963 [INFO] 🕯️ I-TRX_INR    ₹ 29.3200
+2025-10-23 22:22:22,223 [INFO] 🕯️ I-ADA_INR    ₹ 60.3200
+2025-10-23 22:22:22,455 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:22:22,737 [INFO] 🕯️ I-XRP_INR    ₹224.8599
+2025-10-23 22:23:23,926 [INFO] 🕯️ I-TRX_INR    ₹ 29.3300
+2025-10-23 22:23:24,164 [INFO] 🕯️ I-ADA_INR    ₹ 60.3200
+2025-10-23 22:23:24,386 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:23:24,639 [INFO] 🕯️ I-XRP_INR    ₹225.0099
+2025-10-23 22:24:26,388 [INFO] 🕯️ I-TRX_INR    ₹ 29.3300
+2025-10-23 22:24:26,734 [INFO] 🕯️ I-ADA_INR    ₹ 60.4280
+2025-10-23 22:24:26,735 [INFO] 📈 OPENED BUY I-ADA_INR qty=14.8938 @ ₹60.4280 (Scalp: TP=0.8%, SL=0.4%)
+2025-10-23 22:24:28,240 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:24:28,459 [INFO] 🕯️ I-XRP_INR    ₹224.7500
+2025-10-23 22:25:00,174 [INFO] 🕯️ I-ADA_INR    ₹ 60.4280
+2025-10-23 22:25:00,400 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:25:00,635 [INFO] 🕯️ I-XRP_INR    ₹225.4100
+2025-10-23 22:25:31,918 [INFO] 🕯️ I-TRX_INR    ₹ 29.3600
+2025-10-23 22:26:05,390 [INFO] 🕯️ I-TRX_INR    ₹ 29.2500
+2025-10-23 22:26:05,601 [INFO] 🕯️ I-ADA_INR    ₹ 60.4280
+2025-10-23 22:26:05,821 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:26:06,049 [INFO] 🕯️ I-XRP_INR    ₹225.8500
+2025-10-23 22:27:09,570 [INFO] 🕯️ I-TRX_INR    ₹ 29.2500
+2025-10-23 22:27:09,799 [INFO] 🕯️ I-ADA_INR    ₹ 60.5970
+2025-10-23 22:27:10,047 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:27:10,292 [INFO] 🕯️ I-XRP_INR    ₹225.4400
+2025-10-23 22:28:15,514 [INFO] 🕯️ I-TRX_INR    ₹ 29.2500
+2025-10-23 22:28:15,786 [INFO] 🕯️ I-ADA_INR    ₹ 60.5270
+2025-10-23 22:28:16,043 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:28:16,325 [INFO] 🕯️ I-XRP_INR    ₹225.2300
+2025-10-23 22:29:19,728 [INFO] 🕯️ I-TRX_INR    ₹ 29.3700
+2025-10-23 22:29:19,945 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:29:19,946 [INFO] 📉 CLOSED I-ADA_INR | PnL: ₹-6.45 (-0.72%) | Hold: 293s | Reason: sl
+2025-10-23 22:29:21,597 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:29:21,800 [INFO] 🕯️ I-XRP_INR    ₹225.1800
+2025-10-23 22:30:23,098 [INFO] 🕯️ I-TRX_INR    ₹ 29.4100
+2025-10-23 22:30:23,331 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:30:23,577 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:30:23,836 [INFO] 🕯️ I-XRP_INR    ₹225.6218
+2025-10-23 22:31:25,298 [INFO] 🕯️ I-TRX_INR    ₹ 29.3700
+2025-10-23 22:31:25,568 [INFO] 🕯️ I-ADA_INR    ₹ 60.4550
+2025-10-23 22:31:25,817 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:31:26,066 [INFO] 🕯️ I-XRP_INR    ₹224.9700
+2025-10-23 22:32:27,463 [INFO] 🕯️ I-TRX_INR    ₹ 29.4470
+2025-10-23 22:32:27,692 [INFO] 🕯️ I-ADA_INR    ₹ 60.3860
+2025-10-23 22:32:27,929 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:32:28,220 [INFO] 🕯️ I-XRP_INR    ₹224.1000
+2025-10-23 22:33:29,653 [INFO] 🕯️ I-TRX_INR    ₹ 29.3500
+2025-10-23 22:33:29,860 [INFO] 🕯️ I-ADA_INR    ₹ 60.3860
+2025-10-23 22:33:30,088 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:33:30,325 [INFO] 🕯️ I-XRP_INR    ₹224.7300
+2025-10-23 22:34:00,712 [INFO] 🕯️ I-TRX_INR    ₹ 29.3500
+2025-10-23 22:34:00,963 [INFO] 🕯️ I-ADA_INR    ₹ 60.0100
+2025-10-23 22:34:01,188 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:34:01,417 [INFO] 🕯️ I-XRP_INR    ₹224.4600
+2025-10-23 22:35:02,675 [INFO] 🕯️ I-TRX_INR    ₹ 29.3700
+2025-10-23 22:35:02,927 [INFO] 🕯️ I-ADA_INR    ₹ 60.3960
+2025-10-23 22:35:03,138 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:35:03,364 [INFO] 🕯️ I-XRP_INR    ₹223.0441
+2025-10-23 22:36:04,632 [INFO] 🕯️ I-TRX_INR    ₹ 29.3800
+2025-10-23 22:36:04,856 [INFO] 🕯️ I-ADA_INR    ₹ 60.3290
+2025-10-23 22:36:05,075 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:36:05,305 [INFO] 🕯️ I-XRP_INR    ₹225.0987
+2025-10-23 22:37:06,889 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:37:07,118 [INFO] 🕯️ I-ADA_INR    ₹ 60.3780
+2025-10-23 22:37:07,333 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:37:07,560 [INFO] 🕯️ I-XRP_INR    ₹224.8167
+2025-10-23 22:38:08,831 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:38:09,061 [INFO] 🕯️ I-ADA_INR    ₹ 60.3690
+2025-10-23 22:38:09,313 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:38:09,563 [INFO] 🕯️ I-XRP_INR    ₹224.7990
+2025-10-23 22:39:10,896 [INFO] 🕯️ I-TRX_INR    ₹ 29.4250
+2025-10-23 22:39:11,143 [INFO] 🕯️ I-ADA_INR    ₹ 60.0100
+2025-10-23 22:39:11,433 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:39:11,686 [INFO] 🕯️ I-XRP_INR    ₹224.5988
+2025-10-23 22:40:12,965 [INFO] 🕯️ I-TRX_INR    ₹ 29.4100
+2025-10-23 22:40:13,228 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:40:13,473 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:40:13,703 [INFO] 🕯️ I-XRP_INR    ₹224.6461
+2025-10-23 22:41:15,115 [INFO] 🕯️ I-TRX_INR    ₹ 29.4150
+2025-10-23 22:41:15,322 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:41:15,540 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:41:15,758 [INFO] 🕯️ I-XRP_INR    ₹223.0655
+2025-10-23 22:42:17,052 [INFO] 🕯️ I-TRX_INR    ₹ 29.1580
+2025-10-23 22:42:17,272 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:42:17,514 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:42:17,729 [INFO] 🕯️ I-XRP_INR    ₹225.1361
+2025-10-23 22:43:19,026 [INFO] 🕯️ I-TRX_INR    ₹ 29.1580
+2025-10-23 22:43:19,264 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:43:19,514 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:43:19,722 [INFO] 🕯️ I-XRP_INR    ₹224.7500
+2025-10-23 22:44:23,505 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:44:23,720 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:44:23,924 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:44:24,120 [INFO] 🕯️ I-XRP_INR    ₹223.0175
+2025-10-23 22:45:26,332 [INFO] 🕯️ I-TRX_INR    ₹ 29.4100
+2025-10-23 22:45:26,532 [INFO] 🕯️ I-ADA_INR    ₹ 60.2550
+2025-10-23 22:45:26,718 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:45:26,944 [INFO] 🕯️ I-XRP_INR    ₹224.5100
+2025-10-23 22:46:28,018 [INFO] 🕯️ I-TRX_INR    ₹ 29.3800
+2025-10-23 22:46:28,222 [INFO] 🕯️ I-ADA_INR    ₹ 60.2550
+2025-10-23 22:46:28,439 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:46:28,713 [INFO] 🕯️ I-XRP_INR    ₹224.2300
+2025-10-23 22:47:29,864 [INFO] 🕯️ I-TRX_INR    ₹ 29.3900
+2025-10-23 22:47:30,049 [INFO] 🕯️ I-ADA_INR    ₹ 60.3300
+2025-10-23 22:47:30,235 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:47:30,465 [INFO] 🕯️ I-XRP_INR    ₹224.3000
+2025-10-23 22:48:00,668 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:48:00,845 [INFO] 🕯️ I-ADA_INR    ₹ 60.3150
+2025-10-23 22:48:01,042 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:48:01,266 [INFO] 🕯️ I-XRP_INR    ₹224.9076
+2025-10-23 22:49:03,241 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:49:03,424 [INFO] 🕯️ I-ADA_INR    ₹ 59.9950
+2025-10-23 22:49:03,619 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:49:03,828 [INFO] 🕯️ I-XRP_INR    ₹224.3300
+2025-10-23 22:50:04,947 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:50:05,141 [INFO] 🕯️ I-ADA_INR    ₹ 60.3790
+2025-10-23 22:50:05,332 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:50:05,525 [INFO] 🕯️ I-XRP_INR    ₹224.9076
+2025-10-23 22:51:06,553 [INFO] 🕯️ I-TRX_INR    ₹ 29.1510
+2025-10-23 22:51:06,556 [INFO] 📈 OPENED SELL I-TRX_INR qty=30.8737 @ ₹29.1510 (Scalp: TP=0.8%, SL=0.4%)
+2025-10-23 22:51:07,835 [INFO] 🕯️ I-ADA_INR    ₹ 60.3700
+2025-10-23 22:51:08,047 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:51:08,298 [INFO] 🕯️ I-XRP_INR    ₹224.7000
+2025-10-23 22:52:11,695 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:52:11,696 [INFO] ⏳ Ignoring early SL on I-TRX_INR (hold: 64s, PnL: -0.85%)
+2025-10-23 22:52:11,890 [INFO] 🕯️ I-ADA_INR    ₹ 60.3460
+2025-10-23 22:52:12,081 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:52:12,283 [INFO] 🕯️ I-XRP_INR    ₹223.0778
+2025-10-23 22:53:15,885 [INFO] 🕯️ I-TRX_INR    ₹ 29.4000
+2025-10-23 22:53:15,885 [INFO] 📉 CLOSED I-TRX_INR | PnL: ₹-7.69 (-0.85%) | Hold: 129s | Reason: sl
+2025-10-23 22:53:17,450 [INFO] 🕯️ I-ADA_INR    ₹ 60.3460
+2025-10-23 22:53:17,631 [INFO] 🕯️ I-ALGO_INR   ₹ 17.2100
+2025-10-23 22:53:17,826 [INFO] 🕯️ I-XRP_INR    ₹223.0778
+2025-10-23 23:30:39,811 [INFO] ======================================================================
+2025-10-23 23:30:39,813 [INFO] 🚀 CoinDCX Scalping Bot
+2025-10-23 23:30:39,813 [INFO] Capital: ₹350.0 | Margin: ₹300.0 | Leverage: 3x
+2025-10-23 23:30:39,813 [INFO] Strategy: TP=0.8% | SL=0.4% | R:R = 1:2.0
+2025-10-23 23:30:39,813 [INFO] Protection: 120s minimum hold | Emergency SL: 2.0%
+2025-10-23 23:30:39,813 [INFO] Telegram: ✅ Enabled
+2025-10-23 23:30:39,814 [INFO] ======================================================================
+2025-10-23 23:30:41,652 [INFO] ✓ Retrieved 1073 markets
+2025-10-23 23:30:41,655 [INFO] ✅ Selected: I-TRX_INR, I-ADA_INR, I-ALGO_INR, I-XRP_INR
+2025-10-23 23:30:41,657 [INFO] 
+📊 Initializing...
+2025-10-23 23:30:41,854 [INFO] ✓ I-TRX_INR    @ ₹ 29.5400 | Qty:    30.4672
+2025-10-23 23:30:42,019 [INFO] ✓ I-ADA_INR    @ ₹ 60.9840 | Qty:    14.7580
+2025-10-23 23:30:42,220 [INFO] ✓ I-ALGO_INR   @ ₹ 17.1600 | Qty:    52.4476
+2025-10-23 23:30:42,385 [INFO] ✓ I-XRP_INR    @ ₹225.9800 | Qty:     3.9827
+2025-10-23 23:30:42,387 [INFO] 
+✓ Scalping bot running | Press Ctrl+C to stop
+
+2025-10-23 23:30:42,388 [INFO] ✓ Health server starting on port 8080
+2025-10-23 23:31:12,654 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 23:31:12,857 [INFO] 🕯️ I-ADA_INR    ₹ 60.9840
+2025-10-23 23:31:13,046 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1600
+2025-10-23 23:31:13,220 [INFO] 🕯️ I-XRP_INR    ₹226.6199
+2025-10-23 23:32:14,267 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 23:32:14,463 [INFO] 🕯️ I-ADA_INR    ₹ 60.9840
+2025-10-23 23:32:14,645 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1600
+2025-10-23 23:32:14,825 [INFO] 🕯️ I-XRP_INR    ₹226.6200
+2025-10-23 23:33:15,905 [INFO] 🕯️ I-TRX_INR    ₹ 29.5300
+2025-10-23 23:33:16,100 [INFO] 🕯️ I-ADA_INR    ₹ 60.9840
+2025-10-23 23:33:16,303 [INFO] 🕯️ I-ALGO_INR   ₹ 17.1600
+2025-10-23 23:33:16,494 [INFO] 🕯️ I-XRP_INR    ₹226.5899
+2025-10-24 13:11:42,945 [INFO] ======================================================================
+2025-10-24 13:11:42,945 [INFO] 🚀 Perfect Trading Bot v3 (10/10)
+2025-10-24 13:11:42,945 [INFO] Capital: ₹350.0
+2025-10-24 13:11:42,945 [INFO] ======================================================================
+2025-10-24 13:11:44,146 [INFO] ✓ Retrieved 1073 markets
+2025-10-24 13:11:44,330 [INFO] ✅ Selected 5 quality markets
+2025-10-24 13:11:44,335 [INFO] 
+📊 Initializing...
+2025-10-24 13:11:44,525 [INFO] ✓ I-XRP_INR    @ ₹227.2700 | Qty:     1.3200
+2025-10-24 13:11:44,674 [INFO] ✓ I-LINK_INR   @ ₹1646.4990 | Qty:     0.1822
+2025-10-24 13:11:44,795 [INFO] ✓ I-DOT_INR    @ ₹283.5600 | Qty:     1.0580
+2025-10-24 13:11:44,900 [INFO] ✓ I-ADA_INR    @ ₹ 60.6640 | Qty:     4.9453
+2025-10-24 13:11:45,016 [INFO] ✓ I-DOGE_INR   @ ₹ 18.3279 | Qty:    16.3685
+2025-10-24 13:11:45,016 [INFO] 
+✓ Bot running | Press Ctrl+C to stop
+
+2025-10-24 13:11:45,017 [INFO] ✓ Health server starting on port 8080
+2025-10-24 21:14:18,851 [INFO] ======================================================================
+2025-10-24 21:14:18,853 [INFO] 🚀 Mean Reversion Bot
+2025-10-24 21:14:18,853 [INFO] Capital: ₹350.0
+2025-10-24 21:14:18,853 [INFO] Strategy: Bollinger Bands Mean Reversion
+2025-10-24 21:14:18,854 [INFO] Margin: ₹800.0-1200.0 | SL: 0.8% | TP: 1.2%
+2025-10-24 21:14:18,854 [INFO] SKIPS: High volatility periods
+2025-10-24 21:14:18,854 [INFO] ======================================================================
+2025-10-24 21:14:19,654 [ERROR] Telegram error: {"ok":false,"error_code":400,"description":"Bad Request: can't parse entities: Unsupported start tag \"\" at byte offset 146"}
+2025-10-24 21:14:20,020 [INFO] ✓ Retrieved 1073 markets
+2025-10-24 21:14:20,235 [INFO] ✅ Selected 3 markets
+2025-10-24 21:14:20,238 [INFO] 
+📊 Initializing mean reversion bot...
+2025-10-24 21:14:20,440 [INFO] ✓ I-BTC_INR    @ ₹10264339.0000
+2025-10-24 21:14:20,651 [INFO] ✓ I-ETH_INR    @ ₹363227.5000
+2025-10-24 21:14:20,859 [INFO] ✓ I-LINK_INR   @ ₹1645.4500
+2025-10-24 21:14:20,861 [INFO] 
+✓ Mean reversion bot running | Press Ctrl+C to stop
+
+2025-10-24 21:14:20,864 [INFO] ✓ Health server on port 8080
+2025-10-24 21:18:54,732 [INFO] ======================================================================
+2025-10-24 21:18:54,732 [INFO] 🚀 Mean Reversion Bot
+2025-10-24 21:18:54,732 [INFO] Capital: ₹1000.0
+2025-10-24 21:18:54,732 [INFO] Strategy: Bollinger Bands Mean Reversion
+2025-10-24 21:18:54,733 [INFO] Margin: ₹800.0-1200.0 | SL: 0.8% | TP: 1.2%
+2025-10-24 21:18:54,733 [INFO] SKIPS: High volatility periods
+2025-10-24 21:18:54,733 [INFO] ======================================================================
+2025-10-24 21:18:56,209 [INFO] ✓ Retrieved 1073 markets
+2025-10-24 21:18:56,426 [INFO] ✅ Selected 3 markets
+2025-10-24 21:18:56,429 [INFO] 
+📊 Initializing mean reversion bot...
+2025-10-24 21:18:56,655 [INFO] ✓ I-BTC_INR    @ ₹10266234.0000
+2025-10-24 21:18:56,860 [INFO] ✓ I-ETH_INR    @ ₹362685.8000
+2025-10-24 21:18:57,065 [INFO] ✓ I-LINK_INR   @ ₹1633.0080
+2025-10-24 21:18:57,067 [INFO] 
+✓ Mean reversion bot running | Press Ctrl+C to stop
+
+2025-10-24 21:18:57,068 [INFO] ✓ Health server on port 8080
